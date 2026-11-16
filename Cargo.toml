@@ -1,0 +1,19 @@
+[package]
+name = "lynn-pes"
+version = "0.1.0"
+edition = "2021"
+description = "Brother PES embroidery viewer"
+
+# Shown in the window title, the app menu and the AppImage file name.
+[package.metadata]
+display_name = "Lynn PES"
+
+[dependencies]
+eframe = "0.29"
+rfd = "0.15"
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true
