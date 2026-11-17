@@ -1,7 +1,7 @@
 //! Lynn PES (Brother) embroidery viewer & layer composer for Linux By Djk314.
 //!
 //! - Open files with a dialog (Ctrl+O), drag & drop, or a command-line argument
-//! - Add multiple .pes layers, drag them on X/Y with the mouse, resize via corner handle or sidebar
+//! - Add multiple .pes layers, drag them on X/Y with the mouse, resize via corner handle or sidebar, rotate via top handle or sidebar
 //! - Vector rendering: crisp at any zoom; scroll to zoom, middle-drag (or background drag) to pan
 //! - Export the current view to PNG or the merged layers to PES v6 (#PES0060)
 
@@ -57,12 +57,11 @@ struct EmbroideryLayer {
     stitches: Vec<Stitch>,
     palette: Vec<u8>,
     design: Design,
-    /// Offset in 0.1 mm units
     offset_x: i32,
     offset_y: i32,
-    /// Scale multiplier (1.0 = 100%)
     scale_x: f32,
     scale_y: f32,
+    rotation: f32, // en degrés (0..360)
     visible: bool,
 }
 
@@ -73,31 +72,108 @@ impl EmbroideryLayer {
 
     fn scaled_bounds(&self) -> (Pos2, Pos2) {
         let base = self.base_size();
+        let scaled_w = base.x * self.scale_x;
+        let scaled_h = base.y * self.scale_y;
+        let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
         let lo = Vec2::new(self.offset_x as f32, self.offset_y as f32);
-        let min = self.design.min + lo;
-        let max = min + Vec2::new(base.x * self.scale_x, base.y * self.scale_y);
+        let center = self.design.min + lo + local_center;
+
+        let rad = self.rotation.to_radians();
+        let cos_r = rad.cos();
+        let sin_r = rad.sin();
+
+        let half_w = scaled_w * 0.5;
+        let half_h = scaled_h * 0.5;
+        let corners = [
+            Vec2::new(-half_w, -half_h),
+            Vec2::new(half_w, -half_h),
+            Vec2::new(half_w, half_h),
+            Vec2::new(-half_w, half_h),
+        ];
+
+        let mut min = Pos2::new(f32::MAX, f32::MAX);
+        let mut max = Pos2::new(f32::MIN, f32::MIN);
+        for c in &corners {
+            let rot_c = Vec2::new(c.x * cos_r - c.y * sin_r, c.x * sin_r + c.y * cos_r);
+            let pt = center + rot_c;
+            min = min.min(pt);
+            max = max.max(pt);
+        }
         (min, max)
     }
 
     fn transform_point(&self, p: Pos2) -> Pos2 {
+        let base = self.base_size();
+        let scaled_w = base.x * self.scale_x;
+        let scaled_h = base.y * self.scale_y;
+        let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
         let lo = Vec2::new(self.offset_x as f32, self.offset_y as f32);
-        Pos2::new(
-            self.design.min.x + lo.x + (p.x - self.design.min.x) * self.scale_x,
-            self.design.min.y + lo.y + (p.y - self.design.min.y) * self.scale_y,
-        )
+        let center = self.design.min + lo + local_center;
+
+        let local = p - self.design.min;
+        let scaled = Vec2::new(local.x * self.scale_x, local.y * self.scale_y);
+        let centered = scaled - local_center;
+
+        let rad = self.rotation.to_radians();
+        let cos_r = rad.cos();
+        let sin_r = rad.sin();
+        let rotated = Vec2::new(
+            centered.x * cos_r - centered.y * sin_r,
+            centered.x * sin_r + centered.y * cos_r,
+        );
+
+        center + rotated
+    }
+
+    fn contains_pes_point(&self, p_pes: Pos2) -> bool {
+        let base = self.base_size();
+        let scaled_w = base.x * self.scale_x;
+        let scaled_h = base.y * self.scale_y;
+        let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
+        let lo = Vec2::new(self.offset_x as f32, self.offset_y as f32);
+        let center = self.design.min + lo + local_center;
+
+        let rel = p_pes - center;
+        let rad = -self.rotation.to_radians();
+        let cos_r = rad.cos();
+        let sin_r = rad.sin();
+        let unrotated = Vec2::new(
+            rel.x * cos_r - rel.y * sin_r,
+            rel.x * sin_r + rel.y * cos_r,
+        );
+        let local_pt = unrotated + local_center;
+
+        let check_rect = Rect::from_min_size(Pos2::ZERO, base).expand(15.0 / self.scale_x.max(0.1));
+        check_rect.contains(Pos2::new(local_pt.x / self.scale_x, local_pt.y / self.scale_y))
     }
 
     fn transformed_stitches(&self, block_offset: usize, force_first_jump: bool) -> Vec<Stitch> {
-        let lo_x = self.offset_x as f32;
-        let lo_y = self.offset_y as f32;
+        let base = self.base_size();
+        let scaled_w = base.x * self.scale_x;
+        let scaled_h = base.y * self.scale_y;
+        let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
+        let lo = Vec2::new(self.offset_x as f32, self.offset_y as f32);
+        let center = self.design.min + lo + local_center;
+
+        let rad = self.rotation.to_radians();
+        let cos_r = rad.cos();
+        let sin_r = rad.sin();
+
         self.stitches
             .iter()
             .enumerate()
             .map(|(i, s)| {
-                let x = (self.design.min.x + lo_x + (s.x as f32 - self.design.min.x) * self.scale_x)
-                    .round() as i32;
-                let y = (self.design.min.y + lo_y + (s.y as f32 - self.design.min.y) * self.scale_y)
-                    .round() as i32;
+                let local = Pos2::new(s.x as f32, s.y as f32) - self.design.min;
+                let scaled = Vec2::new(local.x * self.scale_x, local.y * self.scale_y);
+                let centered = scaled - local_center;
+                let rotated = Vec2::new(
+                    centered.x * cos_r - centered.y * sin_r,
+                    centered.x * sin_r + centered.y * cos_r,
+                );
+                let final_pt = center + rotated;
+
+                let x = final_pt.x.round() as i32;
+                let y = final_pt.y.round() as i32;
                 let kind = if i == 0 && force_first_jump {
                     StitchKind::Jump
                 } else {
@@ -962,6 +1038,7 @@ enum DragMode {
     None,
     MoveLayer,
     ResizeLayer,
+    RotateLayer,
     PanCanvas,
 }
 
@@ -970,6 +1047,8 @@ struct PesApp {
     active_layer: Option<usize>,
     drag_mode: DragMode,
     drag_accum: Vec2,
+    drag_start_angle: f32,
+    layer_start_rotation: f32,
     lock_aspect: bool,
 
     current: Option<PathBuf>,
@@ -1001,6 +1080,8 @@ impl PesApp {
             active_layer: None,
             drag_mode: DragMode::None,
             drag_accum: Vec2::ZERO,
+            drag_start_angle: 0.0,
+            layer_start_rotation: 0.0,
             lock_aspect: true,
             current: None,
             files: Vec::new(),
@@ -1044,6 +1125,7 @@ impl PesApp {
                     offset_y: 0,
                     scale_x: 1.0,
                     scale_y: 1.0,
+                    rotation: 0.0,
                     visible: true,
                 }
             });
@@ -1641,6 +1723,23 @@ impl eframe::App for PesApp {
                                     }
                                 });
 
+                                // Rotation in degrees
+                                ui.horizontal(|ui| {
+                                    let mut rot = self.layers[idx].rotation;
+                                    ui.label("Rot:");
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut rot)
+                                                .range(0.0..=360.0)
+                                                .speed(1.0)
+                                                .suffix("°"),
+                                        )
+                                        .changed()
+                                    {
+                                        self.layers[idx].rotation = rot.rem_euclid(360.0);
+                                    }
+                                });
+
                                 // Size in mm (W x H) and percentage
                                 let base = self.layers[idx].base_size();
                                 let mut w_mm = (base.x * self.layers[idx].scale_x) / 10.0;
@@ -1691,6 +1790,7 @@ impl eframe::App for PesApp {
                                         self.layers[idx].offset_y = 0;
                                         self.layers[idx].scale_x = 1.0;
                                         self.layers[idx].scale_y = 1.0;
+                                        self.layers[idx].rotation = 0.0;
                                     }
                                     if idx + 1 < count && ui.small_button("↑").clicked() {
                                         swap = Some((idx, idx + 1));
@@ -1764,56 +1864,108 @@ impl eframe::App for PesApp {
 
                 let center = rect.center();
                 let dc = dmin + size / 2.0;
-                let to_screen = |p: Pos2, offset: Vec2, zoom: f32| -> Pos2 {
+                let to_screen_with = |p: Pos2, offset: Vec2, zoom: f32| -> Pos2 {
                     center + offset + (p - dc) * zoom
                 };
-                let screen_to_pes = |s: Pos2, offset: Vec2, zoom: f32| -> Pos2 {
+                let screen_to_pes_with = |s: Pos2, offset: Vec2, zoom: f32| -> Pos2 {
                     dc + (s - center - offset) / zoom
                 };
 
-                // Cursor feedback when hovering active layer's resize handle
-                if let Some(hover_pos) = resp.hover_pos() {
-                    if let Some(idx) = self.active_layer {
-                        if let Some(layer) = self.layers.get(idx) {
-                            if layer.visible {
-                                let (_, bmax) = layer.scaled_bounds();
-                                let handle_screen = to_screen(bmax, self.offset, self.zoom);
-                                if hover_pos.distance(handle_screen) <= 10.0 {
+                // Handle coordinates and cursor feedback for active layer
+                let mut active_handles: Option<(Pos2, Pos2)> = None; // (resize_handle, rotate_handle)
+                if let Some(idx) = self.active_layer {
+                    if let Some(layer) = self.layers.get(idx) {
+                        if layer.visible {
+                            let base = layer.base_size();
+                            let scaled_w = base.x * layer.scale_x;
+                            let scaled_h = base.y * layer.scale_y;
+                            let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
+                            let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
+                            let c_pes = layer.design.min + lo + local_center;
+
+                            let rad = layer.rotation.to_radians();
+                            let cos_r = rad.cos();
+                            let sin_r = rad.sin();
+                            let half_w = scaled_w * 0.5;
+                            let half_h = scaled_h * 0.5;
+
+                            let local_corners = [
+                                Vec2::new(-half_w, -half_h), // Top-Left
+                                Vec2::new(half_w, -half_h),  // Top-Right
+                                Vec2::new(half_w, half_h),   // Bottom-Right
+                                Vec2::new(-half_w, half_h),  // Bottom-Left
+                            ];
+                            let screen_corners = local_corners.map(|c| {
+                                let rot_c = Vec2::new(c.x * cos_r - c.y * sin_r, c.x * sin_r + c.y * cos_r);
+                                to_screen_with(c_pes + rot_c, self.offset, self.zoom)
+                            });
+
+                            let resize_handle = screen_corners[2];
+                            let top_center_screen = screen_corners[0].lerp(screen_corners[1], 0.5);
+                            let rot_dir = Vec2::new(-sin_r, cos_r);
+                            let rotate_handle = top_center_screen - rot_dir * 25.0;
+
+                            active_handles = Some((resize_handle, rotate_handle));
+
+                            if let Some(hover_pos) = resp.hover_pos() {
+                                if hover_pos.distance(resize_handle) <= 12.0 {
                                     ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                                } else if hover_pos.distance(rotate_handle) <= 12.0 {
+                                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
                                 }
                             }
                         }
                     }
                 }
 
-                // Drag start: check resize handle first, then layer body, else canvas pan
+                // Drag start: check handles first, then layer body, else canvas pan
                 if resp.drag_started_by(egui::PointerButton::Primary) {
                     if let Some(pos) = resp.interact_pointer_pos() {
-                        let mut hit_resize = false;
-                        if let Some(idx) = self.active_layer {
-                            if let Some(layer) = self.layers.get(idx) {
-                                if layer.visible {
-                                    let (_, bmax) = layer.scaled_bounds();
-                                    if pos.distance(to_screen(bmax, self.offset, self.zoom)) <= 12.0 {
-                                        self.drag_mode = DragMode::ResizeLayer;
-                                        hit_resize = true;
-                                    }
+                        let mut hit_action = false;
+                        if let Some((resize_handle, rotate_handle)) = active_handles {
+                            if pos.distance(rotate_handle) <= 14.0 {
+                                self.drag_mode = DragMode::RotateLayer;
+                                if let Some(idx) = self.active_layer {
+                                    let layer = &self.layers[idx];
+                                    let base = layer.base_size();
+                                    let scaled_w = base.x * layer.scale_x;
+                                    let scaled_h = base.y * layer.scale_y;
+                                    let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
+                                    let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
+                                    let center_screen =
+                                        to_screen_with(layer.design.min + lo + local_center, self.offset, self.zoom);
+                                    let v = pos - center_screen;
+                                    self.drag_start_angle = v.y.atan2(v.x);
+                                    self.layer_start_rotation = layer.rotation;
                                 }
+                                hit_action = true;
+                            } else if pos.distance(resize_handle) <= 14.0 {
+                                self.drag_mode = DragMode::ResizeLayer;
+                                hit_action = true;
                             }
                         }
 
-                        if !hit_resize {
-                            let p_pes = screen_to_pes(pos, self.offset, self.zoom);
-                            self.active_layer = self.layers.iter().enumerate().rev().find_map(|(idx, l)| {
-                                if !l.visible {
-                                    return None;
+                        if !hit_action {
+                            let p_pes = screen_to_pes_with(pos, self.offset, self.zoom);
+                            let mut clicked_layer = None;
+                            if let Some(active) = self.active_layer {
+                                if let Some(l) = self.layers.get(active) {
+                                    if l.visible && l.contains_pes_point(p_pes) {
+                                        clicked_layer = Some(active);
+                                    }
                                 }
-                                let (bmin, bmax) = l.scaled_bounds();
-                                Rect::from_min_max(bmin, bmax)
-                                .expand(15.0)
-                                .contains(p_pes)
-                                .then_some(idx)
-                            });
+                            }
+                            if clicked_layer.is_none() {
+                                clicked_layer = self.layers.iter().enumerate().rev().find_map(|(idx, l)| {
+                                    if l.visible && l.contains_pes_point(p_pes) {
+                                        Some(idx)
+                                    } else {
+                                        None
+                                    }
+                                });
+                            }
+
+                            self.active_layer = clicked_layer;
                             if self.active_layer.is_some() {
                                 self.drag_mode = DragMode::MoveLayer;
                                 self.drag_accum = Vec2::ZERO;
@@ -1826,16 +1978,66 @@ impl eframe::App for PesApp {
 
                 if resp.dragged_by(egui::PointerButton::Primary) {
                     match self.drag_mode {
+                        DragMode::RotateLayer => {
+                            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                            if let (Some(idx), Some(pointer)) =
+                                (self.active_layer, resp.interact_pointer_pos())
+                            {
+                                let (center_screen, start_rot) = {
+                                    let layer = &self.layers[idx];
+                                    let base = layer.base_size();
+                                    let scaled_w = base.x * layer.scale_x;
+                                    let scaled_h = base.y * layer.scale_y;
+                                    let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
+                                    let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
+                                    (
+                                        to_screen_with(
+                                            layer.design.min + lo + local_center,
+                                            self.offset,
+                                            self.zoom,
+                                        ),
+                                        self.layer_start_rotation,
+                                    )
+                                };
+
+                                let v = pointer - center_screen;
+                                let current_angle = v.y.atan2(v.x);
+                                let delta_angle = (current_angle - self.drag_start_angle).to_degrees();
+                                let mut new_rot = start_rot + delta_angle;
+                                if ctx.input(|i| i.modifiers.shift) {
+                                    let snap = (new_rot / 45.0).round() * 45.0;
+                                    if (new_rot - snap).abs() < 5.0 {
+                                        new_rot = snap;
+                                    }
+                                }
+                                self.layers[idx].rotation = new_rot.rem_euclid(360.0);
+                            }
+                        }
                         DragMode::ResizeLayer => {
                             ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
-                            if let (Some(idx), Some(pointer)) = (self.active_layer, resp.interact_pointer_pos()) {
-                                let p_pes = screen_to_pes(pointer, self.offset, self.zoom);
-                                let layer = &mut self.layers[idx];
-                                let (bmin, _) = layer.scaled_bounds();
-                                let base = layer.base_size();
-                                let target_w = (p_pes.x - bmin.x).max(10.0);
-                                let target_h = (p_pes.y - bmin.y).max(10.0);
+                            if let (Some(idx), Some(pointer)) =
+                                (self.active_layer, resp.interact_pointer_pos())
+                            {
+                                let p_pes = screen_to_pes_with(pointer, self.offset, self.zoom);
                                 let keep_ratio = self.lock_aspect != ctx.input(|i| i.modifiers.shift);
+                                let layer = &mut self.layers[idx];
+                                let base = layer.base_size();
+                                let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
+                                let local_center =
+                                    Vec2::new(base.x * layer.scale_x * 0.5, base.y * layer.scale_y * 0.5);
+                                let center_pes = layer.design.min + lo + local_center;
+
+                                let rel = p_pes - center_pes;
+                                let rad = -layer.rotation.to_radians();
+                                let cos_r = rad.cos();
+                                let sin_r = rad.sin();
+                                let unrotated = Vec2::new(
+                                    rel.x * cos_r - rel.y * sin_r,
+                                    rel.x * sin_r + rel.y * cos_r,
+                                );
+                                let target_w = (unrotated.x * 2.0).abs().max(10.0);
+                                let target_h = (unrotated.y * 2.0).abs().max(10.0);
+
                                 if keep_ratio {
                                     let s = (target_w / base.x).max(target_h / base.y).clamp(0.05, 20.0);
                                     layer.scale_x = s;
@@ -1887,7 +2089,7 @@ impl eframe::App for PesApp {
                     }
                 }
 
-                // Paint: rebind a simple 1-argument `to_screen` now that offset/zoom are finalized
+                // Paint
                 let (zoom, offset) = (self.zoom, self.offset);
                 let to_screen = |p: Pos2| -> Pos2 { center + offset + (p - dc) * zoom };
                 let width = (THREAD_MM * 10.0 * zoom).max(1.0);
@@ -2002,21 +2204,53 @@ impl eframe::App for PesApp {
                         }
                     }
 
-                    // Active layer bounding box + bottom-right resize handle
+                    // Active layer selection box, resize handle & rotation handle
                     if self.active_layer == Some(idx) {
-                        let (lmin, lmax) = layer.scaled_bounds();
-                        let bmin = to_screen(lmin);
-                        let bmax = to_screen(lmax);
+                        let base = layer.base_size();
+                        let scaled_w = base.x * layer.scale_x;
+                        let scaled_h = base.y * layer.scale_y;
+                        let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
+                        let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
+                        let c_pes = layer.design.min + lo + local_center;
+
+                        let rad = layer.rotation.to_radians();
+                        let cos_r = rad.cos();
+                        let sin_r = rad.sin();
+                        let half_w = scaled_w * 0.5;
+                        let half_h = scaled_h * 0.5;
+
+                        let local_corners = [
+                            Vec2::new(-half_w, -half_h),
+                            Vec2::new(half_w, -half_h),
+                            Vec2::new(half_w, half_h),
+                            Vec2::new(-half_w, half_h),
+                        ];
+                        let sc = local_corners.map(|c| {
+                            let rot_c = Vec2::new(c.x * cos_r - c.y * sin_r, c.x * sin_r + c.y * cos_r);
+                            to_screen(c_pes + rot_c)
+                        });
+
                         let accent = Color32::from_rgb(60, 160, 255);
-                        painter.rect_stroke(
-                            Rect::from_min_max(bmin, bmax),
-                            0.0,
-                            Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(60, 160, 255, 190)),
-                        );
-                        // Bottom-right corner handle
-                        let handle_rect = Rect::from_center_size(bmax, Vec2::splat(10.0));
-                        painter.rect_filled(handle_rect, 2.0, accent);
-                        painter.rect_stroke(handle_rect, 2.0, Stroke::new(1.0_f32, Color32::WHITE));
+                        for i in 0..4 {
+                            painter.line_segment(
+                                [sc[i], sc[(i + 1) % 4]],
+                                Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(60, 160, 255, 190)),
+                            );
+                        }
+
+                        // Bottom-right resize handle
+                        let resize_rect = Rect::from_center_size(sc[2], Vec2::splat(10.0));
+                        painter.rect_filled(resize_rect, 2.0, accent);
+                        painter.rect_stroke(resize_rect, 2.0, Stroke::new(1.0_f32, Color32::WHITE));
+
+                        // Top rotation handle & stem line
+                        let top_center = sc[0].lerp(sc[1], 0.5);
+                        let rot_dir = Vec2::new(-sin_r, cos_r);
+                        let rot_handle = top_center - rot_dir * 25.0;
+                        painter.line_segment([top_center, rot_handle], Stroke::new(1.0_f32, accent));
+                        let rot_rect = Rect::from_center_size(rot_handle, Vec2::splat(10.0));
+                        painter.rect_filled(rot_rect, 5.0, Color32::from_rgb(50, 200, 100));
+                        painter.rect_stroke(rot_rect, 5.0, Stroke::new(1.0_f32, Color32::WHITE));
                     }
                 }
             });
