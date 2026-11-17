@@ -4,5 +4,9 @@ A simple embroadery PES Brother file viewer, written in Rust for Linux.
 - 2d view / Embroadery 
 - links wires
 - Density Slider
-- Layer to add a file
-- Resize and move layers
+- Background color
+- Layer to add a file (PES and SVG)
+- Resize, Rotate and move layers
+- Load SVG
+- Edit Curves and stitches points
+  <img width="1919" height="1016" alt="2026-11-17_16-01" src="https://github.com/user-attachments/assets/f1a6ca5d-c416-403e-b431-30cb5eb84f8b" />
