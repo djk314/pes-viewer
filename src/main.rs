@@ -1,8 +1,7 @@
 //! Lynn PES (Brother) embroidery viewer & layer composer for Linux By Djk314.
 //!
-//! - Open files with a dialog (Ctrl+O), drag & drop, or a command-line argument
-//! - Add multiple .pes layers, drag them on X/Y with the mouse, resize via corner handle or sidebar, rotate via top handle or sidebar
-//! - Vector rendering: crisp at any zoom; scroll to zoom, middle-drag (or background drag) to pan
+//! - Open .pes and .svg files with a dialog (Ctrl+O), drag & drop, or a command-line argument
+//! - Add multiple .pes / .svg layers, drag, resize, rotate, and edit vector/Bezier nodes directly
 //! - Export the current view to PNG or the merged layers to PES v6 (#PES0060)
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Pos2, Rect, Sense, Shape, Stroke, Vec2};
@@ -13,14 +12,12 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 // ---------------------------------------------------------------------------
-// Data model
+// Data model & Vector Node / Bezier structures
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum StitchKind {
-    /// Pen down: draw a line from the previous point.
     Stitch,
-    /// Jump or trim: move without drawing.
     Jump,
 }
 
@@ -32,6 +29,23 @@ struct Stitch {
     kind: StitchKind,
     /// Color block index (incremented on every color change).
     block: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct VectorNode {
+    /// Position de l'ancre en unités PEC (0.1 mm)
+    pos: Pos2,
+    /// Poignée entrante relative à `pos` (Vec2::ZERO si segment droit)
+    handle_in: Vec2,
+    /// Poignée sortante relative à `pos` (Vec2::ZERO si segment droit)
+    handle_out: Vec2,
+}
+
+#[derive(Debug, Clone)]
+struct VectorPath {
+    color: u8,
+    nodes: Vec<VectorNode>,
+    closed: bool,
 }
 
 /// A polyline drawn with one thread color.
@@ -57,6 +71,8 @@ struct EmbroideryLayer {
     stitches: Vec<Stitch>,
     palette: Vec<u8>,
     design: Design,
+    /// Chemins vectoriels éditables (présents nativement pour les SVG, ou générés à la demande pour les PES)
+    vector_paths: Option<Vec<VectorPath>>,
     offset_x: i32,
     offset_y: i32,
     scale_x: f32,
@@ -125,7 +141,8 @@ impl EmbroideryLayer {
         center + rotated
     }
 
-    fn contains_pes_point(&self, p_pes: Pos2) -> bool {
+    /// Transformation inverse : convertit un point dans l'espace monde PEC vers l'espace local non-transformé du calque.
+    fn inverse_transform_point(&self, world_p: Pos2) -> Pos2 {
         let base = self.base_size();
         let scaled_w = base.x * self.scale_x;
         let scaled_h = base.y * self.scale_y;
@@ -133,7 +150,7 @@ impl EmbroideryLayer {
         let lo = Vec2::new(self.offset_x as f32, self.offset_y as f32);
         let center = self.design.min + lo + local_center;
 
-        let rel = p_pes - center;
+        let rel = world_p - center;
         let rad = -self.rotation.to_radians();
         let cos_r = rad.cos();
         let sin_r = rad.sin();
@@ -141,10 +158,66 @@ impl EmbroideryLayer {
             rel.x * cos_r - rel.y * sin_r,
             rel.x * sin_r + rel.y * cos_r,
         );
-        let local_pt = unrotated + local_center;
+        let scaled = unrotated + local_center;
+        let local = Vec2::new(
+            scaled.x / self.scale_x.max(1e-4),
+            scaled.y / self.scale_y.max(1e-4),
+        );
+        self.design.min + local
+    }
 
+    fn contains_pes_point(&self, p_pes: Pos2) -> bool {
+        let base = self.base_size();
+        let local_pt = self.inverse_transform_point(p_pes) - self.design.min;
         let check_rect = Rect::from_min_size(Pos2::ZERO, base).expand(15.0 / self.scale_x.max(0.1));
-        check_rect.contains(Pos2::new(local_pt.x / self.scale_x, local_pt.y / self.scale_y))
+        check_rect.contains(Pos2::new(local_pt.x, local_pt.y))
+    }
+
+    /// Convertit les points d'un calque `.pes` en chemins vectoriels éditables si ce n'est pas déjà fait.
+    fn ensure_vector_paths(&mut self) {
+        if self.vector_paths.is_some() {
+            return;
+        }
+        let mut paths = Vec::new();
+        for run in &self.design.runs {
+            if run.pts.len() < 2 {
+                continue;
+            }
+            let nodes: Vec<VectorNode> = run
+                .pts
+                .iter()
+                .map(|&p| VectorNode {
+                    pos: p,
+                    handle_in: Vec2::ZERO,
+                    handle_out: Vec2::ZERO,
+                })
+                .collect();
+            paths.push(VectorPath {
+                color: run.color,
+                nodes,
+                closed: false,
+            });
+        }
+        self.vector_paths = Some(paths);
+    }
+
+    /// Recalcule les points de broderie (`stitches`, `palette`, `design`) à partir des `vector_paths` modifiés.
+    fn rebuild_from_vector_paths(&mut self) {
+        let Some(ref paths) = self.vector_paths else { return };
+        let (stitches, palette) = sample_vector_paths_to_stitches(paths);
+        if stitches.is_empty() {
+            return;
+        }
+        // Préserve l'ancrage visuel dans l'espace monde si le bounding box local change
+        let old_min = self.design.min;
+        let new_design = build_design(&stitches, &palette);
+        let delta_min = new_design.min - old_min;
+        self.offset_x += (delta_min.x * self.scale_x).round() as i32;
+        self.offset_y += (delta_min.y * self.scale_y).round() as i32;
+
+        self.stitches = stitches;
+        self.palette = palette;
+        self.design = new_design;
     }
 
     fn transformed_stitches(&self, block_offset: usize, force_first_jump: bool) -> Vec<Stitch> {
@@ -188,6 +261,369 @@ impl EmbroideryLayer {
             })
             .collect()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Bezier evaluation & Vector Path -> Stitch sampling
+// ---------------------------------------------------------------------------
+
+const SVG_STITCH_STEP_PEC: f32 = 25.0; // 2.5 mm entre deux piqûres d'aiguille
+const SVG_PX_TO_PEC: f32 = 2.6458333;
+
+
+fn flatten_cubic(p0: Pos2, p1: Pos2, p2: Pos2, p3: Pos2, tol: f32, out: &mut Vec<Pos2>) {
+    let chord = p3 - p0;
+    let len_sq = chord.length_sq();
+    let d1 = if len_sq > 1e-6 {
+        ((p1 - p0).x * chord.y - (p1 - p0).y * chord.x).abs() / len_sq.sqrt()
+    } else {
+        (p1 - p0).length()
+    };
+    let d2 = if len_sq > 1e-6 {
+        ((p2 - p0).x * chord.y - (p2 - p0).y * chord.x).abs() / len_sq.sqrt()
+    } else {
+        (p2 - p0).length()
+    };
+
+    if d1.max(d2) <= tol {
+        out.push(p3);
+        return;
+    }
+
+    let p01 = p0.lerp(p1, 0.5);
+    let p12 = p1.lerp(p2, 0.5);
+    let p23 = p2.lerp(p3, 0.5);
+    let p012 = p01.lerp(p12, 0.5);
+    let p123 = p12.lerp(p23, 0.5);
+    let p0123 = p012.lerp(p123, 0.5);
+
+    flatten_cubic(p0, p01, p012, p0123, tol, out);
+    flatten_cubic(p0123, p123, p23, p3, tol, out);
+}
+
+/// Génère une polyligne aplatie pour le segment entre `n0` et `n1`.
+fn sample_segment_polyline(n0: &VectorNode, n1: &VectorNode) -> Vec<Pos2> {
+    let mut poly = vec![n0.pos];
+    if n0.handle_out == Vec2::ZERO && n1.handle_in == Vec2::ZERO {
+        poly.push(n1.pos);
+    } else {
+        let p1 = n0.pos + n0.handle_out;
+        let p2 = n1.pos + n1.handle_in;
+        flatten_cubic(n0.pos, p1, p2, n1.pos, 1.2, &mut poly);
+    }
+    poly
+}
+
+/// Échantillonne une liste de `VectorPath` en `Stitch` et palette PEC.
+fn sample_vector_paths_to_stitches(paths: &[VectorPath]) -> (Vec<Stitch>, Vec<u8>) {
+    let mut stitches = Vec::new();
+    let mut palette = Vec::new();
+    let mut last_color: Option<u8> = None;
+
+    for vp in paths {
+        if vp.nodes.len() < 2 {
+            continue;
+        }
+        if last_color != Some(vp.color) {
+            palette.push(vp.color);
+            last_color = Some(vp.color);
+        }
+        let block = palette.len().saturating_sub(1);
+
+        let mut full_poly: Vec<Pos2> = Vec::new();
+        let seg_count = if vp.closed { vp.nodes.len() } else { vp.nodes.len() - 1 };
+
+        for i in 0..seg_count {
+            let n0 = &vp.nodes[i];
+            let n1 = &vp.nodes[(i + 1) % vp.nodes.len()];
+            let seg_pts = sample_segment_polyline(n0, n1);
+            if full_poly.is_empty() {
+                full_poly.extend(seg_pts);
+            } else {
+                full_poly.extend(seg_pts.into_iter().skip(1));
+            }
+        }
+
+        if full_poly.len() < 2 {
+            continue;
+        }
+
+        let first = full_poly[0];
+        stitches.push(Stitch {
+            x: first.x.round() as i32,
+            y: first.y.round() as i32,
+            kind: StitchKind::Jump,
+            block,
+        });
+
+        for pair in full_poly.windows(2) {
+            let (a, b) = (pair[0], pair[1]);
+            let dist = a.distance(b);
+            if dist < 0.2 {
+                continue;
+            }
+            let steps = (dist / SVG_STITCH_STEP_PEC).ceil().max(1.0) as usize;
+            for k in 1..=steps {
+                let t = k as f32 / steps as f32;
+                let p = a.lerp(b, t);
+                stitches.push(Stitch {
+                    x: p.x.round() as i32,
+                    y: p.y.round() as i32,
+                    kind: StitchKind::Stitch,
+                    block,
+                });
+            }
+        }
+    }
+
+    (stitches, palette)
+}
+
+// ---------------------------------------------------------------------------
+// File format helpers (.pes & .svg)
+// ---------------------------------------------------------------------------
+
+fn is_supported_embroidery_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("pes") || ext.eq_ignore_ascii_case("svg"))
+        .unwrap_or(false)
+}
+
+fn load_layer_from_file(path: &Path) -> Result<EmbroideryLayer, String> {
+    let data = fs::read(path).map_err(|e| e.to_string())?;
+    let is_svg = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("svg"))
+        .unwrap_or(false);
+
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Layer".into());
+
+    if is_svg {
+        let vector_paths = parse_svg_to_vector_paths(&data)?;
+        let (stitches, palette) = sample_vector_paths_to_stitches(&vector_paths);
+        if stitches.is_empty() {
+            return Err("no stitches generated from SVG".into());
+        }
+        let design = build_design(&stitches, &palette);
+        Ok(EmbroideryLayer {
+            name,
+            stitches,
+            palette,
+            design,
+            vector_paths: Some(vector_paths),
+            offset_x: 0,
+            offset_y: 0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            visible: true,
+        })
+    } else {
+        let (stitches, palette) = parse_pes(&data)?;
+        let design = build_design(&stitches, &palette);
+        Ok(EmbroideryLayer {
+            name,
+            stitches,
+            palette,
+            design,
+            vector_paths: None,
+            offset_x: 0,
+            offset_y: 0,
+            scale_x: 1.0,
+            scale_y: 1.0,
+            rotation: 0.0,
+            visible: true,
+        })
+    }
+}
+
+fn parse_design_file(path: &Path) -> Result<(Vec<Stitch>, Vec<u8>), String> {
+    let data = fs::read(path).map_err(|e| e.to_string())?;
+    let is_svg = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("svg"))
+        .unwrap_or(false);
+    if is_svg {
+        let vpaths = parse_svg_to_vector_paths(&data)?;
+        let (stitches, palette) = sample_vector_paths_to_stitches(&vpaths);
+        if stitches.is_empty() {
+            return Err("no stitches found in SVG".into());
+        }
+        Ok((stitches, palette))
+    } else {
+        parse_pes(&data)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SVG parsing into editable Bezier VectorPaths
+// ---------------------------------------------------------------------------
+
+fn nearest_pec_color(r: u8, g: u8, b: u8) -> u8 {
+    let mut best_idx = 20u8;
+    let mut best_dist = u32::MAX;
+    for (i, &hex) in PEC_PALETTE.iter().enumerate() {
+        let pr = ((hex >> 16) & 0xFF) as i32;
+        let pg = ((hex >> 8) & 0xFF) as i32;
+        let pb = (hex & 0xFF) as i32;
+        let dr = r as i32 - pr;
+        let dg = g as i32 - pg;
+        let db = b as i32 - pb;
+        let dist = (dr * dr + dg * dg + db * db) as u32;
+        if dist < best_dist {
+            best_dist = dist;
+            best_idx = (i + 1) as u8;
+        }
+    }
+    best_idx
+}
+
+fn extract_usvg_paint_color(paint: &usvg::Paint) -> [u8; 3] {
+    match paint {
+        usvg::Paint::Color(c) => [c.red, c.green, c.blue],
+        usvg::Paint::LinearGradient(g) => g
+            .stops()
+            .first()
+            .map(|s| [s.color().red, s.color().green, s.color().blue])
+            .unwrap_or([0, 0, 0]),
+        usvg::Paint::RadialGradient(g) => g
+            .stops()
+            .first()
+            .map(|s| [s.color().red, s.color().green, s.color().blue])
+            .unwrap_or([0, 0, 0]),
+        usvg::Paint::Pattern(_) => [0, 0, 0],
+    }
+}
+
+fn collect_usvg_vector_paths(group: &usvg::Group, out_paths: &mut Vec<VectorPath>) {
+    for node in group.children() {
+        match node {
+            usvg::Node::Group(sub) => {
+                collect_usvg_vector_paths(sub, out_paths);
+            }
+            usvg::Node::Path(path) => {
+                if !path.is_visible() {
+                    continue;
+                }
+                let rgb = if let Some(stroke) = path.stroke() {
+                    extract_usvg_paint_color(stroke.paint())
+                } else if let Some(fill) = path.fill() {
+                    extract_usvg_paint_color(fill.paint())
+                } else {
+                    [0, 0, 0]
+                };
+                let pec_color = nearest_pec_color(rgb[0], rgb[1], rgb[2]);
+
+                let xf = path.abs_transform();
+                let to_pec = |pt: usvg::tiny_skia_path::Point| -> Pos2 {
+                    let tx = xf.sx * pt.x + xf.kx * pt.y + xf.tx;
+                    let ty = xf.ky * pt.x + xf.sy * pt.y + xf.ty;
+                    Pos2::new(tx * SVG_PX_TO_PEC, ty * SVG_PX_TO_PEC)
+                };
+
+                let mut cur_nodes: Vec<VectorNode> = Vec::new();
+                for seg in path.data().segments() {
+                    match seg {
+                        usvg::tiny_skia_path::PathSegment::MoveTo(p) => {
+                            if cur_nodes.len() >= 2 {
+                                out_paths.push(VectorPath {
+                                    color: pec_color,
+                                    nodes: std::mem::take(&mut cur_nodes),
+                                    closed: false,
+                                });
+                            } else {
+                                cur_nodes.clear();
+                            }
+                            cur_nodes.push(VectorNode {
+                                pos: to_pec(p),
+                                handle_in: Vec2::ZERO,
+                                handle_out: Vec2::ZERO,
+                            });
+                        }
+                        usvg::tiny_skia_path::PathSegment::LineTo(p) => {
+                            cur_nodes.push(VectorNode {
+                                pos: to_pec(p),
+                                handle_in: Vec2::ZERO,
+                                handle_out: Vec2::ZERO,
+                            });
+                        }
+                        usvg::tiny_skia_path::PathSegment::QuadTo(p1, p2) => {
+                            if let Some(prev) = cur_nodes.last_mut() {
+                                let p0 = prev.pos;
+                                let qp1 = to_pec(p1);
+                                let qp2 = to_pec(p2);
+                                // Conversion quadratique -> cubique exacte
+                                let c1 = p0.lerp(qp1, 2.0 / 3.0);
+                                let c2 = qp2.lerp(qp1, 2.0 / 3.0);
+                                prev.handle_out = c1 - p0;
+                                cur_nodes.push(VectorNode {
+                                    pos: qp2,
+                                    handle_in: c2 - qp2,
+                                    handle_out: Vec2::ZERO,
+                                });
+                            }
+                        }
+                        usvg::tiny_skia_path::PathSegment::CubicTo(p1, p2, p3) => {
+                            if let Some(prev) = cur_nodes.last_mut() {
+                                let c1 = to_pec(p1);
+                                let c2 = to_pec(p2);
+                                let end = to_pec(p3);
+                                prev.handle_out = c1 - prev.pos;
+                                cur_nodes.push(VectorNode {
+                                    pos: end,
+                                    handle_in: c2 - end,
+                                    handle_out: Vec2::ZERO,
+                                });
+                            }
+                        }
+                        usvg::tiny_skia_path::PathSegment::Close => {
+                            if cur_nodes.len() >= 2 {
+                                // Si le dernier point est confondu avec le premier, on transfère sa poignée entrante
+                                if cur_nodes.len() >= 3
+                                    && cur_nodes.last().unwrap().pos.distance(cur_nodes[0].pos) < 0.2
+                                {
+                                    let last = cur_nodes.pop().unwrap();
+                                    cur_nodes[0].handle_in = last.handle_in;
+                                }
+                                out_paths.push(VectorPath {
+                                    color: pec_color,
+                                    nodes: std::mem::take(&mut cur_nodes),
+                                    closed: true,
+                                });
+                            } else {
+                                cur_nodes.clear();
+                            }
+                        }
+                    }
+                }
+                if cur_nodes.len() >= 2 {
+                    out_paths.push(VectorPath {
+                        color: pec_color,
+                        nodes: cur_nodes,
+                        closed: false,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn parse_svg_to_vector_paths(data: &[u8]) -> Result<Vec<VectorPath>, String> {
+    let opt = usvg::Options::default();
+    let tree = usvg::Tree::from_data(data, &opt).map_err(|e| format!("SVG parse error: {e}"))?;
+    let mut paths = Vec::new();
+    collect_usvg_vector_paths(tree.root(), &mut paths);
+    if paths.is_empty() {
+        return Err("no vector paths found in SVG".into());
+    }
+    Ok(paths)
 }
 
 // ---------------------------------------------------------------------------
@@ -828,8 +1264,7 @@ const PREVIEW_SIZE: u32 = 480;
 const THUMB_BG: [u8; 3] = [215, 215, 220];
 
 fn read_design(path: &Path) -> Result<Design, String> {
-    let data = fs::read(path).map_err(|e| e.to_string())?;
-    let (stitches, palette) = parse_pes(&data)?;
+    let (stitches, palette) = parse_design_file(path)?;
     Ok(build_design(&stitches, &palette))
 }
 
@@ -1007,11 +1442,7 @@ impl Browser {
             }
             if path.is_dir() {
                 folders.push(path);
-            } else if path
-                .extension()
-                .map(|x| x.eq_ignore_ascii_case("pes"))
-                .unwrap_or(false)
-            {
+            } else if is_supported_embroidery_file(&path) {
                 files.push(path);
             }
         }
@@ -1028,7 +1459,7 @@ impl Browser {
 }
 
 // ---------------------------------------------------------------------------
-// Application
+// Application & Node Editor State
 // ---------------------------------------------------------------------------
 
 const ACTUAL_SIZE_ZOOM: f32 = 96.0 / 254.0;
@@ -1040,6 +1471,15 @@ enum DragMode {
     ResizeLayer,
     RotateLayer,
     PanCanvas,
+    DragNode,
+    DragHandleIn,
+    DragHandleOut,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct NodeSelection {
+    path_idx: usize,
+    node_idx: usize,
 }
 
 struct PesApp {
@@ -1050,6 +1490,10 @@ struct PesApp {
     drag_start_angle: f32,
     layer_start_rotation: f32,
     lock_aspect: bool,
+
+    // Mode édition de nœuds / courbes de Bézier
+    node_edit_mode: bool,
+    selected_node: Option<NodeSelection>,
 
     current: Option<PathBuf>,
     files: Vec<PathBuf>,
@@ -1083,6 +1527,8 @@ impl PesApp {
             drag_start_angle: 0.0,
             layer_start_rotation: 0.0,
             lock_aspect: true,
+            node_edit_mode: false,
+            selected_node: None,
             current: None,
             files: Vec::new(),
             scroll_to_current: false,
@@ -1107,30 +1553,7 @@ impl PesApp {
     }
 
     fn load(&mut self, path: PathBuf, append: bool) {
-        let result = fs::read(&path)
-            .map_err(|e| e.to_string())
-            .and_then(|data| parse_pes(&data))
-            .map(|(stitches, palette)| {
-                let design = build_design(&stitches, &palette);
-                let name = path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "Layer".into());
-                EmbroideryLayer {
-                    name,
-                    stitches,
-                    palette,
-                    design,
-                    offset_x: 0,
-                    offset_y: 0,
-                    scale_x: 1.0,
-                    scale_y: 1.0,
-                    rotation: 0.0,
-                    visible: true,
-                }
-            });
-
-        match result {
+        match load_layer_from_file(&path) {
             Ok(layer) => {
                 if !append {
                     self.layers.clear();
@@ -1142,10 +1565,74 @@ impl PesApp {
                 }
                 self.layers.push(layer);
                 self.active_layer = Some(self.layers.len() - 1);
+                self.selected_node = None;
                 self.browser = None;
                 self.status.clear();
             }
             Err(e) => self.status = format!("{}: {e}", path.display()),
+        }
+    }
+
+    fn delete_selected_node(&mut self) {
+        let (Some(layer_idx), Some(sel)) = (self.active_layer, self.selected_node) else {
+            return;
+        };
+        let Some(layer) = self.layers.get_mut(layer_idx) else { return };
+        let Some(ref mut vpaths) = layer.vector_paths else { return };
+
+        if let Some(vp) = vpaths.get_mut(sel.path_idx) {
+            if vp.nodes.len() > 2 && sel.node_idx < vp.nodes.len() {
+                vp.nodes.remove(sel.node_idx);
+                self.selected_node = Some(NodeSelection {
+                    path_idx: sel.path_idx,
+                    node_idx: sel.node_idx.saturating_sub(1),
+                });
+                layer.rebuild_from_vector_paths();
+            } else if vp.nodes.len() <= 2 && vpaths.len() > 1 {
+                vpaths.remove(sel.path_idx);
+                self.selected_node = None;
+                layer.rebuild_from_vector_paths();
+            }
+        }
+    }
+
+    fn toggle_selected_node_bezier(&mut self) {
+        let (Some(layer_idx), Some(sel)) = (self.active_layer, self.selected_node) else {
+            return;
+        };
+        let Some(layer) = self.layers.get_mut(layer_idx) else { return };
+        let Some(ref mut vpaths) = layer.vector_paths else { return };
+
+        if let Some(vp) = vpaths.get_mut(sel.path_idx) {
+            let count = vp.nodes.len();
+            if sel.node_idx >= count {
+                return;
+            }
+            let is_curved = vp.nodes[sel.node_idx].handle_in != Vec2::ZERO
+                || vp.nodes[sel.node_idx].handle_out != Vec2::ZERO;
+            if is_curved {
+                vp.nodes[sel.node_idx].handle_in = Vec2::ZERO;
+                vp.nodes[sel.node_idx].handle_out = Vec2::ZERO;
+            } else {
+                let prev_pos = if sel.node_idx > 0 {
+                    vp.nodes[sel.node_idx - 1].pos
+                } else if vp.closed {
+                    vp.nodes[count - 1].pos
+                } else {
+                    vp.nodes[sel.node_idx].pos - Vec2::new(20.0, 0.0)
+                };
+                let next_pos = if sel.node_idx + 1 < count {
+                    vp.nodes[sel.node_idx + 1].pos
+                } else if vp.closed {
+                    vp.nodes[0].pos
+                } else {
+                    vp.nodes[sel.node_idx].pos + Vec2::new(20.0, 0.0)
+                };
+                let tangent = (next_pos - prev_pos) * 0.25;
+                vp.nodes[sel.node_idx].handle_in = -tangent;
+                vp.nodes[sel.node_idx].handle_out = tangent;
+            }
+            layer.rebuild_from_vector_paths();
         }
     }
 
@@ -1177,11 +1664,7 @@ impl PesApp {
             .map(|rd| {
                 rd.filter_map(|e| e.ok())
                     .map(|e| e.path())
-                    .filter(|p| {
-                        p.extension()
-                            .map(|x| x.eq_ignore_ascii_case("pes"))
-                            .unwrap_or(false)
-                    })
+                    .filter(|p| is_supported_embroidery_file(p))
                     .collect()
             })
             .unwrap_or_default();
@@ -1334,7 +1817,7 @@ impl PesApp {
                 }
             }
             if br.folders.is_empty() && br.files.is_empty() {
-                ui.label("No sub-folders or .pes files here.");
+                ui.label("No sub-folders, .pes or .svg files here.");
             }
             ui.add_space(6.0);
 
@@ -1438,10 +1921,12 @@ impl PesApp {
     }
 
     fn pick_file(&mut self, add_as_layer: bool) {
-        let title = if add_as_layer { "Add PES layer" } else { "Open a PES file" };
+        let title = if add_as_layer { "Add PES or SVG layer" } else { "Open a PES or SVG file" };
         if let Some(p) = rfd::FileDialog::new()
             .set_title(title)
+            .add_filter("Embroidery & Vector (PES, SVG)", &["pes", "PES", "svg", "SVG"])
             .add_filter("PES embroidery", &["pes", "PES"])
+            .add_filter("SVG vector", &["svg", "SVG"])
             .pick_file()
         {
             self.load(p, add_as_layer);
@@ -1520,17 +2005,23 @@ impl eframe::App for PesApp {
             if i.modifiers.command && i.key_pressed(Key::O) {
                 want_dialog = Some(i.modifiers.shift);
             }
-            if i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::PageDown) {
-                nav = 1;
-            }
-            if i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::PageUp) {
-                nav = -1;
+            if !self.node_edit_mode {
+                if i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::PageDown) {
+                    nav = 1;
+                }
+                if i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::PageUp) {
+                    nav = -1;
+                }
             }
             if i.key_pressed(Key::F) {
                 self.fit_pending = true;
             }
             if i.key_pressed(Key::Escape) {
                 close_browser = true;
+                self.selected_node = None;
+            }
+            if self.node_edit_mode && (i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
+                self.delete_selected_node();
             }
         });
 
@@ -1554,6 +2045,47 @@ impl eframe::App for PesApp {
                         nav = 1;
                     }
                 });
+                ui.separator();
+
+                // Bouton d'activation de l'éditeur de nœuds / courbes de Bézier
+                let can_edit_nodes = self.active_layer.is_some();
+                if ui
+                    .add_enabled(
+                        can_edit_nodes,
+                        egui::SelectableLabel::new(self.node_edit_mode, "✎ Edit Nodes"),
+                    )
+                    .on_hover_text("Éditer les points et courbes de Bézier du calque actif")
+                    .clicked()
+                {
+                    self.node_edit_mode = !self.node_edit_mode;
+                    if self.node_edit_mode {
+                        if let Some(idx) = self.active_layer {
+                            if let Some(layer) = self.layers.get_mut(idx) {
+                                layer.ensure_vector_paths();
+                            }
+                        }
+                    } else {
+                        self.selected_node = None;
+                    }
+                }
+
+                if self.node_edit_mode {
+                    if ui
+                        .add_enabled(self.selected_node.is_some(), egui::Button::new("Curve / Line"))
+                        .on_hover_text("Basculer le nœud entre courbe de Bézier et angle droit")
+                        .clicked()
+                    {
+                        self.toggle_selected_node_bezier();
+                    }
+                    if ui
+                        .add_enabled(self.selected_node.is_some(), egui::Button::new("Delete Node"))
+                        .on_hover_text("Supprimer le point sélectionné (Suppr)")
+                        .clicked()
+                    {
+                        self.delete_selected_node();
+                    }
+                }
+
                 ui.separator();
                 if ui.button("Fit").clicked() {
                     self.fit_pending = true;
@@ -1602,7 +2134,12 @@ impl eframe::App for PesApp {
         // ---- status bar --------------------------------------------------
         egui::TopBottomPanel::bottom("status").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                if let Some((dmin, dmax)) = self.combined_bounds() {
+                if self.node_edit_mode {
+                    ui.colored_label(
+                        Color32::from_rgb(100, 210, 255),
+                        "NODE MODE: Drag nodes/Bezier handles | Double-click segment to add node | Right-click or Del to remove | Alt+drag handle to break tangent",
+                    );
+                } else if let Some((dmin, dmax)) = self.combined_bounds() {
                     let size = dmax - dmin;
                     let total_stitches: usize = self
                         .layers
@@ -1700,10 +2237,13 @@ impl eframe::App for PesApp {
                                         .clicked()
                                     {
                                         self.active_layer = Some(idx);
+                                        self.selected_node = None;
+                                        if self.node_edit_mode {
+                                            self.layers[idx].ensure_vector_paths();
+                                        }
                                     }
                                 });
 
-                                // Position in mm
                                 ui.horizontal(|ui| {
                                     let mut x_mm = self.layers[idx].offset_x as f32 / 10.0;
                                     let mut y_mm = self.layers[idx].offset_y as f32 / 10.0;
@@ -1723,7 +2263,6 @@ impl eframe::App for PesApp {
                                     }
                                 });
 
-                                // Rotation in degrees
                                 ui.horizontal(|ui| {
                                     let mut rot = self.layers[idx].rotation;
                                     ui.label("Rot:");
@@ -1740,7 +2279,6 @@ impl eframe::App for PesApp {
                                     }
                                 });
 
-                                // Size in mm (W x H) and percentage
                                 let base = self.layers[idx].base_size();
                                 let mut w_mm = (base.x * self.layers[idx].scale_x) / 10.0;
                                 let mut h_mm = (base.y * self.layers[idx].scale_y) / 10.0;
@@ -1818,6 +2356,7 @@ impl eframe::App for PesApp {
                     if let Some(idx) = remove {
                         self.layers.remove(idx);
                         self.active_layer = self.layers.len().checked_sub(1);
+                        self.selected_node = None;
                     }
                 });
         }
@@ -1844,7 +2383,7 @@ impl eframe::App for PesApp {
                     painter.text(
                         rect.center(),
                         Align2::CENTER_CENTER,
-                        "Open a .pes file (Ctrl+O) or drop files here",
+                        "Open a .pes or .svg file (Ctrl+O) or drop files here",
                         FontId::proportional(18.0),
                         Color32::GRAY,
                     );
@@ -1853,7 +2392,7 @@ impl eframe::App for PesApp {
                 let size = dmax - dmin;
 
                 // Fit to window
-                if self.fit_pending || resp.double_clicked() {
+                if self.fit_pending || (!self.node_edit_mode && resp.double_clicked()) {
                     let margin = 30.0;
                     let fx = (rect.width() - 2.0 * margin).max(1.0) / size.x.max(1.0);
                     let fy = (rect.height() - 2.0 * margin).max(1.0) / size.y.max(1.0);
@@ -1871,206 +2410,529 @@ impl eframe::App for PesApp {
                     dc + (s - center - offset) / zoom
                 };
 
-                // Handle coordinates and cursor feedback for active layer
-                let mut active_handles: Option<(Pos2, Pos2)> = None; // (resize_handle, rotate_handle)
-                if let Some(idx) = self.active_layer {
-                    if let Some(layer) = self.layers.get(idx) {
-                        if layer.visible {
-                            let base = layer.base_size();
-                            let scaled_w = base.x * layer.scale_x;
-                            let scaled_h = base.y * layer.scale_y;
-                            let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
-                            let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
-                            let c_pes = layer.design.min + lo + local_center;
+                // -----------------------------------------------------------
+                // MODE ÉDITION DE NŒUDS / COURBES DE BÉZIER
+                // -----------------------------------------------------------
+                if self.node_edit_mode {
+                    if let Some(layer_idx) = self.active_layer {
+                        if let Some(layer) = self.layers.get_mut(layer_idx) {
+                            layer.ensure_vector_paths();
+                        }
 
-                            let rad = layer.rotation.to_radians();
-                            let cos_r = rad.cos();
-                            let sin_r = rad.sin();
-                            let half_w = scaled_w * 0.5;
-                            let half_h = scaled_h * 0.5;
-
-                            let local_corners = [
-                                Vec2::new(-half_w, -half_h), // Top-Left
-                                Vec2::new(half_w, -half_h),  // Top-Right
-                                Vec2::new(half_w, half_h),   // Bottom-Right
-                                Vec2::new(-half_w, half_h),  // Bottom-Left
-                            ];
-                            let screen_corners = local_corners.map(|c| {
-                                let rot_c = Vec2::new(c.x * cos_r - c.y * sin_r, c.x * sin_r + c.y * cos_r);
-                                to_screen_with(c_pes + rot_c, self.offset, self.zoom)
-                            });
-
-                            let resize_handle = screen_corners[2];
-                            let top_center_screen = screen_corners[0].lerp(screen_corners[1], 0.5);
-                            let rot_dir = Vec2::new(-sin_r, cos_r);
-                            let rotate_handle = top_center_screen - rot_dir * 25.0;
-
-                            active_handles = Some((resize_handle, rotate_handle));
-
-                            if let Some(hover_pos) = resp.hover_pos() {
-                                if hover_pos.distance(resize_handle) <= 12.0 {
-                                    ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
-                                } else if hover_pos.distance(rotate_handle) <= 12.0 {
-                                    ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                        // 1. Clic droit sur un nœud -> Suppression immédiate
+                        if resp.secondary_clicked() {
+                            if let Some(click_pos) = resp.interact_pointer_pos() {
+                                let mut to_remove: Option<NodeSelection> = None;
+                                if let Some(layer) = self.layers.get(layer_idx) {
+                                    if let Some(ref vpaths) = layer.vector_paths {
+                                        for (pi, vp) in vpaths.iter().enumerate() {
+                                            for (ni, node) in vp.nodes.iter().enumerate() {
+                                                let sp = to_screen_with(
+                                                    layer.transform_point(node.pos),
+                                                    self.offset,
+                                                    self.zoom,
+                                                );
+                                                if click_pos.distance(sp) <= 10.0 {
+                                                    to_remove = Some(NodeSelection {
+                                                        path_idx: pi,
+                                                        node_idx: ni,
+                                                    });
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(sel) = to_remove {
+                                    self.selected_node = Some(sel);
+                                    self.delete_selected_node();
                                 }
                             }
+                        }
+
+                        // 2. Double-clic sur un segment -> Ajout d'un nouveau nœud
+                        if resp.double_clicked() {
+                            if let Some(click_pos) = resp.interact_pointer_pos() {
+                                if let Some(layer) = self.layers.get_mut(layer_idx) {
+                                    let local_click = layer.inverse_transform_point(
+                                        screen_to_pes_with(click_pos, self.offset, self.zoom),
+                                    );
+                                    let mut best_hit: Option<(usize, usize, f32, Pos2, bool)> = None;
+
+                                    if let Some(ref vpaths) = layer.vector_paths {
+                                        for (pi, vp) in vpaths.iter().enumerate() {
+                                            let seg_count = if vp.closed {
+                                                vp.nodes.len()
+                                            } else {
+                                                vp.nodes.len().saturating_sub(1)
+                                            };
+                                            for si in 0..seg_count {
+                                                let n0 = &vp.nodes[si];
+                                                let n1 = &vp.nodes[(si + 1) % vp.nodes.len()];
+                                                let is_bezier = n0.handle_out != Vec2::ZERO
+                                                || n1.handle_in != Vec2::ZERO;
+                                                let poly = sample_segment_polyline(n0, n1);
+                                                for pair in poly.windows(2) {
+                                                    let (a, b) = (pair[0], pair[1]);
+                                                    let ab = b - a;
+                                                    let t = if ab.length_sq() > 1e-6 {
+                                                        ((local_click - a).dot(ab) / ab.length_sq())
+                                                        .clamp(0.0, 1.0)
+                                                    } else {
+                                                        0.0
+                                                    };
+                                                    let proj = a + ab * t;
+                                                    let screen_dist = click_pos.distance(
+                                                        to_screen_with(
+                                                            layer.transform_point(proj),
+                                                                       self.offset,
+                                                                       self.zoom,
+                                                        ),
+                                                    );
+                                                    if screen_dist <= 12.0 {
+                                                        if best_hit
+                                                            .map_or(true, |(_, _, d, _, _)| screen_dist < d)
+                                                            {
+                                                                best_hit = Some((
+                                                                    pi,
+                                                                    si + 1,
+                                                                    screen_dist,
+                                                                    proj,
+                                                                    is_bezier,
+                                                                ));
+                                                            }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if let Some((pi, insert_idx, _, proj, is_bezier)) = best_hit {
+                                        let (hin, hout) = if is_bezier {
+                                            (Vec2::new(-15.0, 0.0), Vec2::new(15.0, 0.0))
+                                        } else {
+                                            (Vec2::ZERO, Vec2::ZERO)
+                                        };
+                                        if let Some(ref mut vpaths) = layer.vector_paths {
+                                            vpaths[pi].nodes.insert(
+                                                insert_idx,
+                                                VectorNode {
+                                                    pos: proj,
+                                                    handle_in: hin,
+                                                    handle_out: hout,
+                                                },
+                                            );
+                                            self.selected_node = Some(NodeSelection {
+                                                path_idx: pi,
+                                                node_idx: insert_idx,
+                                            });
+                                        }
+                                        layer.rebuild_from_vector_paths();
+                                    }
+                                }
+                            }
+                        }
+
+                        // 3. Début de glisser-déposer (Poignée Bézier, Nœud d'ancrage, ou Panoramique)
+                        if resp.drag_started_by(egui::PointerButton::Primary) {
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                let mut hit = false;
+                                if let Some(layer) = self.layers.get(layer_idx) {
+                                    if let Some(ref vpaths) = layer.vector_paths {
+                                        // Priorité 1 : poignées de Bézier du nœud sélectionné
+                                        if let Some(sel) = self.selected_node {
+                                            if let Some(vp) = vpaths.get(sel.path_idx) {
+                                                if let Some(node) = vp.nodes.get(sel.node_idx) {
+                                                    if node.handle_in != Vec2::ZERO {
+                                                        let h_in_s = to_screen_with(
+                                                            layer.transform_point(
+                                                                node.pos + node.handle_in,
+                                                            ),
+                                                            self.offset,
+                                                            self.zoom,
+                                                        );
+                                                        if pos.distance(h_in_s) <= 11.0 {
+                                                            self.drag_mode = DragMode::DragHandleIn;
+                                                            hit = true;
+                                                        }
+                                                    }
+                                                    if !hit && node.handle_out != Vec2::ZERO {
+                                                        let h_out_s = to_screen_with(
+                                                            layer.transform_point(
+                                                                node.pos + node.handle_out,
+                                                            ),
+                                                            self.offset,
+                                                            self.zoom,
+                                                        );
+                                                        if pos.distance(h_out_s) <= 11.0 {
+                                                            self.drag_mode = DragMode::DragHandleOut;
+                                                            hit = true;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+
+                                        // Priorité 2 : nœuds d'ancrage
+                                        if !hit {
+                                            for (pi, vp) in vpaths.iter().enumerate() {
+                                                for (ni, node) in vp.nodes.iter().enumerate() {
+                                                    let sp = to_screen_with(
+                                                        layer.transform_point(node.pos),
+                                                        self.offset,
+                                                        self.zoom,
+                                                    );
+                                                    if pos.distance(sp) <= 10.0 {
+                                                        self.selected_node = Some(NodeSelection {
+                                                            path_idx: pi,
+                                                            node_idx: ni,
+                                                        });
+                                                        self.drag_mode = DragMode::DragNode;
+                                                        hit = true;
+                                                        break;
+                                                    }
+                                                }
+                                                if hit {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if !hit {
+                                    self.drag_mode = DragMode::PanCanvas;
+                                }
+                            }
+                        }
+
+                        // 4. Mise à jour pendant le glissement d'un nœud ou d'une poignée Bézier
+                        if resp.dragged_by(egui::PointerButton::Primary) {
+                            match self.drag_mode {
+                                DragMode::DragNode => {
+                                    if let (Some(pointer), Some(sel)) =
+                                        (resp.interact_pointer_pos(), self.selected_node)
+                                    {
+                                        if let Some(layer) = self.layers.get_mut(layer_idx) {
+                                            let local_pos = layer.inverse_transform_point(
+                                                screen_to_pes_with(pointer, self.offset, self.zoom),
+                                            );
+                                            if let Some(ref mut vpaths) = layer.vector_paths {
+                                                if let Some(vp) = vpaths.get_mut(sel.path_idx) {
+                                                    if let Some(node) = vp.nodes.get_mut(sel.node_idx)
+                                                    {
+                                                        node.pos = local_pos;
+                                                    }
+                                                }
+                                            }
+                                            layer.rebuild_from_vector_paths();
+                                        }
+                                    }
+                                }
+                                DragMode::DragHandleIn => {
+                                    if let (Some(pointer), Some(sel)) =
+                                        (resp.interact_pointer_pos(), self.selected_node)
+                                    {
+                                        let break_sym = ctx.input(|i| i.modifiers.alt);
+                                        if let Some(layer) = self.layers.get_mut(layer_idx) {
+                                            let local_pos = layer.inverse_transform_point(
+                                                screen_to_pes_with(pointer, self.offset, self.zoom),
+                                            );
+                                            if let Some(ref mut vpaths) = layer.vector_paths {
+                                                if let Some(vp) = vpaths.get_mut(sel.path_idx) {
+                                                    if let Some(node) = vp.nodes.get_mut(sel.node_idx)
+                                                    {
+                                                        node.handle_in = local_pos - node.pos;
+                                                        if !break_sym
+                                                            && node.handle_out != Vec2::ZERO
+                                                        {
+                                                            let out_len = node.handle_out.length();
+                                                            if node.handle_in.length() > 1e-4 {
+                                                                node.handle_out = -node
+                                                                    .handle_in
+                                                                    .normalized()
+                                                                    * out_len;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            layer.rebuild_from_vector_paths();
+                                        }
+                                    }
+                                }
+                                DragMode::DragHandleOut => {
+                                    if let (Some(pointer), Some(sel)) =
+                                        (resp.interact_pointer_pos(), self.selected_node)
+                                    {
+                                        let break_sym = ctx.input(|i| i.modifiers.alt);
+                                        if let Some(layer) = self.layers.get_mut(layer_idx) {
+                                            let local_pos = layer.inverse_transform_point(
+                                                screen_to_pes_with(pointer, self.offset, self.zoom),
+                                            );
+                                            if let Some(ref mut vpaths) = layer.vector_paths {
+                                                if let Some(vp) = vpaths.get_mut(sel.path_idx) {
+                                                    if let Some(node) = vp.nodes.get_mut(sel.node_idx)
+                                                    {
+                                                        node.handle_out = local_pos - node.pos;
+                                                        if !break_sym
+                                                            && node.handle_in != Vec2::ZERO
+                                                        {
+                                                            let in_len = node.handle_in.length();
+                                                            if node.handle_out.length() > 1e-4 {
+                                                                node.handle_in = -node
+                                                                    .handle_out
+                                                                    .normalized()
+                                                                    * in_len;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            layer.rebuild_from_vector_paths();
+                                        }
+                                    }
+                                }
+                                DragMode::PanCanvas | DragMode::None => {
+                                    self.offset += resp.drag_delta();
+                                }
+                                _ => {}
+                            }
+                        } else if resp.dragged_by(egui::PointerButton::Middle) {
+                            self.offset += resp.drag_delta();
+                        }
+
+                        if resp.drag_stopped() {
+                            self.drag_mode = DragMode::None;
                         }
                     }
-                }
+                } else {
+                    // -----------------------------------------------------------
+                    // MODE NORMAL (Déplacement / Redimensionnement / Rotation)
+                    // -----------------------------------------------------------
+                    let mut active_handles: Option<(Pos2, Pos2)> = None;
+                    if let Some(idx) = self.active_layer {
+                        if let Some(layer) = self.layers.get(idx) {
+                            if layer.visible {
+                                let base = layer.base_size();
+                                let scaled_w = base.x * layer.scale_x;
+                                let scaled_h = base.y * layer.scale_y;
+                                let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
+                                let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
+                                let c_pes = layer.design.min + lo + local_center;
 
-                // Drag start: check handles first, then layer body, else canvas pan
-                if resp.drag_started_by(egui::PointerButton::Primary) {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        let mut hit_action = false;
-                        if let Some((resize_handle, rotate_handle)) = active_handles {
-                            if pos.distance(rotate_handle) <= 14.0 {
-                                self.drag_mode = DragMode::RotateLayer;
-                                if let Some(idx) = self.active_layer {
-                                    let layer = &self.layers[idx];
-                                    let base = layer.base_size();
-                                    let scaled_w = base.x * layer.scale_x;
-                                    let scaled_h = base.y * layer.scale_y;
-                                    let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
-                                    let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
-                                    let center_screen =
-                                        to_screen_with(layer.design.min + lo + local_center, self.offset, self.zoom);
-                                    let v = pos - center_screen;
-                                    self.drag_start_angle = v.y.atan2(v.x);
-                                    self.layer_start_rotation = layer.rotation;
-                                }
-                                hit_action = true;
-                            } else if pos.distance(resize_handle) <= 14.0 {
-                                self.drag_mode = DragMode::ResizeLayer;
-                                hit_action = true;
-                            }
-                        }
+                                let rad = layer.rotation.to_radians();
+                                let cos_r = rad.cos();
+                                let sin_r = rad.sin();
+                                let half_w = scaled_w * 0.5;
+                                let half_h = scaled_h * 0.5;
 
-                        if !hit_action {
-                            let p_pes = screen_to_pes_with(pos, self.offset, self.zoom);
-                            let mut clicked_layer = None;
-                            if let Some(active) = self.active_layer {
-                                if let Some(l) = self.layers.get(active) {
-                                    if l.visible && l.contains_pes_point(p_pes) {
-                                        clicked_layer = Some(active);
-                                    }
-                                }
-                            }
-                            if clicked_layer.is_none() {
-                                clicked_layer = self.layers.iter().enumerate().rev().find_map(|(idx, l)| {
-                                    if l.visible && l.contains_pes_point(p_pes) {
-                                        Some(idx)
-                                    } else {
-                                        None
-                                    }
+                                let local_corners = [
+                                    Vec2::new(-half_w, -half_h),
+                                    Vec2::new(half_w, -half_h),
+                                    Vec2::new(half_w, half_h),
+                                    Vec2::new(-half_w, half_h),
+                                ];
+                                let screen_corners = local_corners.map(|c| {
+                                    let rot_c = Vec2::new(
+                                        c.x * cos_r - c.y * sin_r,
+                                        c.x * sin_r + c.y * cos_r,
+                                    );
+                                    to_screen_with(c_pes + rot_c, self.offset, self.zoom)
                                 });
-                            }
 
-                            self.active_layer = clicked_layer;
-                            if self.active_layer.is_some() {
-                                self.drag_mode = DragMode::MoveLayer;
-                                self.drag_accum = Vec2::ZERO;
-                            } else {
-                                self.drag_mode = DragMode::PanCanvas;
+                                let resize_handle = screen_corners[2];
+                                let top_center_screen =
+                                    screen_corners[0].lerp(screen_corners[1], 0.5);
+                                let rot_dir = Vec2::new(-sin_r, cos_r);
+                                let rotate_handle = top_center_screen - rot_dir * 25.0;
+
+                                active_handles = Some((resize_handle, rotate_handle));
+
+                                if let Some(hover_pos) = resp.hover_pos() {
+                                    if hover_pos.distance(resize_handle) <= 12.0 {
+                                        ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                                    } else if hover_pos.distance(rotate_handle) <= 12.0 {
+                                        ctx.set_cursor_icon(egui::CursorIcon::Grab);
+                                    }
+                                }
                             }
                         }
                     }
-                }
 
-                if resp.dragged_by(egui::PointerButton::Primary) {
-                    match self.drag_mode {
-                        DragMode::RotateLayer => {
-                            ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
-                            if let (Some(idx), Some(pointer)) =
-                                (self.active_layer, resp.interact_pointer_pos())
-                            {
-                                let (center_screen, start_rot) = {
-                                    let layer = &self.layers[idx];
-                                    let base = layer.base_size();
-                                    let scaled_w = base.x * layer.scale_x;
-                                    let scaled_h = base.y * layer.scale_y;
-                                    let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
-                                    let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
-                                    (
-                                        to_screen_with(
+                    if resp.drag_started_by(egui::PointerButton::Primary) {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            let mut hit_action = false;
+                            if let Some((resize_handle, rotate_handle)) = active_handles {
+                                if pos.distance(rotate_handle) <= 14.0 {
+                                    self.drag_mode = DragMode::RotateLayer;
+                                    if let Some(idx) = self.active_layer {
+                                        let layer = &self.layers[idx];
+                                        let base = layer.base_size();
+                                        let scaled_w = base.x * layer.scale_x;
+                                        let scaled_h = base.y * layer.scale_y;
+                                        let local_center =
+                                            Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
+                                        let lo = Vec2::new(
+                                            layer.offset_x as f32,
+                                            layer.offset_y as f32,
+                                        );
+                                        let center_screen = to_screen_with(
                                             layer.design.min + lo + local_center,
                                             self.offset,
                                             self.zoom,
-                                        ),
-                                        self.layer_start_rotation,
-                                    )
-                                };
+                                        );
+                                        let v = pos - center_screen;
+                                        self.drag_start_angle = v.y.atan2(v.x);
+                                        self.layer_start_rotation = layer.rotation;
+                                    }
+                                    hit_action = true;
+                                } else if pos.distance(resize_handle) <= 14.0 {
+                                    self.drag_mode = DragMode::ResizeLayer;
+                                    hit_action = true;
+                                }
+                            }
 
-                                let v = pointer - center_screen;
-                                let current_angle = v.y.atan2(v.x);
-                                let delta_angle = (current_angle - self.drag_start_angle).to_degrees();
-                                let mut new_rot = start_rot + delta_angle;
-                                if ctx.input(|i| i.modifiers.shift) {
-                                    let snap = (new_rot / 45.0).round() * 45.0;
-                                    if (new_rot - snap).abs() < 5.0 {
-                                        new_rot = snap;
+                            if !hit_action {
+                                let p_pes = screen_to_pes_with(pos, self.offset, self.zoom);
+                                let mut clicked_layer = None;
+                                if let Some(active) = self.active_layer {
+                                    if let Some(l) = self.layers.get(active) {
+                                        if l.visible && l.contains_pes_point(p_pes) {
+                                            clicked_layer = Some(active);
+                                        }
                                     }
                                 }
-                                self.layers[idx].rotation = new_rot.rem_euclid(360.0);
-                            }
-                        }
-                        DragMode::ResizeLayer => {
-                            ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
-                            if let (Some(idx), Some(pointer)) =
-                                (self.active_layer, resp.interact_pointer_pos())
-                            {
-                                let p_pes = screen_to_pes_with(pointer, self.offset, self.zoom);
-                                let keep_ratio = self.lock_aspect != ctx.input(|i| i.modifiers.shift);
-                                let layer = &mut self.layers[idx];
-                                let base = layer.base_size();
-                                let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
-                                let local_center =
-                                    Vec2::new(base.x * layer.scale_x * 0.5, base.y * layer.scale_y * 0.5);
-                                let center_pes = layer.design.min + lo + local_center;
+                                if clicked_layer.is_none() {
+                                    clicked_layer =
+                                        self.layers.iter().enumerate().rev().find_map(|(idx, l)| {
+                                            if l.visible && l.contains_pes_point(p_pes) {
+                                                Some(idx)
+                                            } else {
+                                                None
+                                            }
+                                        });
+                                }
 
-                                let rel = p_pes - center_pes;
-                                let rad = -layer.rotation.to_radians();
-                                let cos_r = rad.cos();
-                                let sin_r = rad.sin();
-                                let unrotated = Vec2::new(
-                                    rel.x * cos_r - rel.y * sin_r,
-                                    rel.x * sin_r + rel.y * cos_r,
-                                );
-                                let target_w = (unrotated.x * 2.0).abs().max(10.0);
-                                let target_h = (unrotated.y * 2.0).abs().max(10.0);
-
-                                if keep_ratio {
-                                    let s = (target_w / base.x).max(target_h / base.y).clamp(0.05, 20.0);
-                                    layer.scale_x = s;
-                                    layer.scale_y = s;
+                                self.active_layer = clicked_layer;
+                                if self.active_layer.is_some() {
+                                    self.drag_mode = DragMode::MoveLayer;
+                                    self.drag_accum = Vec2::ZERO;
                                 } else {
-                                    layer.scale_x = (target_w / base.x).clamp(0.05, 20.0);
-                                    layer.scale_y = (target_h / base.y).clamp(0.05, 20.0);
+                                    self.drag_mode = DragMode::PanCanvas;
                                 }
                             }
-                        }
-                        DragMode::MoveLayer => {
-                            if let Some(idx) = self.active_layer {
-                                self.drag_accum += resp.drag_delta() / self.zoom;
-                                let dx = self.drag_accum.x.trunc() as i32;
-                                let dy = self.drag_accum.y.trunc() as i32;
-                                if dx != 0 || dy != 0 {
-                                    self.layers[idx].offset_x += dx;
-                                    self.layers[idx].offset_y += dy;
-                                    self.drag_accum.x -= dx as f32;
-                                    self.drag_accum.y -= dy as f32;
-                                }
-                            }
-                        }
-                        DragMode::PanCanvas | DragMode::None => {
-                            self.offset += resp.drag_delta();
                         }
                     }
-                } else if resp.dragged_by(egui::PointerButton::Middle) {
-                    self.offset += resp.drag_delta();
-                }
 
-                if resp.drag_stopped() {
-                    self.drag_mode = DragMode::None;
+                    if resp.dragged_by(egui::PointerButton::Primary) {
+                        match self.drag_mode {
+                            DragMode::RotateLayer => {
+                                ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
+                                if let (Some(idx), Some(pointer)) =
+                                    (self.active_layer, resp.interact_pointer_pos())
+                                {
+                                    let (center_screen, start_rot) = {
+                                        let layer = &self.layers[idx];
+                                        let base = layer.base_size();
+                                        let scaled_w = base.x * layer.scale_x;
+                                        let scaled_h = base.y * layer.scale_y;
+                                        let local_center =
+                                            Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
+                                        let lo = Vec2::new(
+                                            layer.offset_x as f32,
+                                            layer.offset_y as f32,
+                                        );
+                                        (
+                                            to_screen_with(
+                                                layer.design.min + lo + local_center,
+                                                self.offset,
+                                                self.zoom,
+                                            ),
+                                            self.layer_start_rotation,
+                                        )
+                                    };
+
+                                    let v = pointer - center_screen;
+                                    let current_angle = v.y.atan2(v.x);
+                                    let delta_angle =
+                                        (current_angle - self.drag_start_angle).to_degrees();
+                                    let mut new_rot = start_rot + delta_angle;
+                                    if ctx.input(|i| i.modifiers.shift) {
+                                        let snap = (new_rot / 45.0).round() * 45.0;
+                                        if (new_rot - snap).abs() < 5.0 {
+                                            new_rot = snap;
+                                        }
+                                    }
+                                    self.layers[idx].rotation = new_rot.rem_euclid(360.0);
+                                }
+                            }
+                            DragMode::ResizeLayer => {
+                                ctx.set_cursor_icon(egui::CursorIcon::ResizeNwSe);
+                                if let (Some(idx), Some(pointer)) =
+                                    (self.active_layer, resp.interact_pointer_pos())
+                                {
+                                    let p_pes =
+                                        screen_to_pes_with(pointer, self.offset, self.zoom);
+                                    let keep_ratio =
+                                        self.lock_aspect != ctx.input(|i| i.modifiers.shift);
+                                    let layer = &mut self.layers[idx];
+                                    let base = layer.base_size();
+                                    let lo =
+                                        Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
+                                    let local_center = Vec2::new(
+                                        base.x * layer.scale_x * 0.5,
+                                        base.y * layer.scale_y * 0.5,
+                                    );
+                                    let center_pes = layer.design.min + lo + local_center;
+
+                                    let rel = p_pes - center_pes;
+                                    let rad = -layer.rotation.to_radians();
+                                    let cos_r = rad.cos();
+                                    let sin_r = rad.sin();
+                                    let unrotated = Vec2::new(
+                                        rel.x * cos_r - rel.y * sin_r,
+                                        rel.x * sin_r + rel.y * cos_r,
+                                    );
+                                    let target_w = (unrotated.x * 2.0).abs().max(10.0);
+                                    let target_h = (unrotated.y * 2.0).abs().max(10.0);
+
+                                    if keep_ratio {
+                                        let s = (target_w / base.x)
+                                            .max(target_h / base.y)
+                                            .clamp(0.05, 20.0);
+                                        layer.scale_x = s;
+                                        layer.scale_y = s;
+                                    } else {
+                                        layer.scale_x = (target_w / base.x).clamp(0.05, 20.0);
+                                        layer.scale_y = (target_h / base.y).clamp(0.05, 20.0);
+                                    }
+                                }
+                            }
+                            DragMode::MoveLayer => {
+                                if let Some(idx) = self.active_layer {
+                                    self.drag_accum += resp.drag_delta() / self.zoom;
+                                    let dx = self.drag_accum.x.trunc() as i32;
+                                    let dy = self.drag_accum.y.trunc() as i32;
+                                    if dx != 0 || dy != 0 {
+                                        self.layers[idx].offset_x += dx;
+                                        self.layers[idx].offset_y += dy;
+                                        self.drag_accum.x -= dx as f32;
+                                        self.drag_accum.y -= dy as f32;
+                                    }
+                                }
+                            }
+                            DragMode::PanCanvas | DragMode::None => {
+                                self.offset += resp.drag_delta();
+                            }
+                            _ => {}
+                        }
+                    } else if resp.dragged_by(egui::PointerButton::Middle) {
+                        self.offset += resp.drag_delta();
+                    }
+
+                    if resp.drag_stopped() {
+                        self.drag_mode = DragMode::None;
+                    }
                 }
 
                 // Zoom around the cursor
@@ -2204,53 +3066,170 @@ impl eframe::App for PesApp {
                         }
                     }
 
-                    // Active layer selection box, resize handle & rotation handle
+                    // Overlay d'édition sur le calque actif
                     if self.active_layer == Some(idx) {
-                        let base = layer.base_size();
-                        let scaled_w = base.x * layer.scale_x;
-                        let scaled_h = base.y * layer.scale_y;
-                        let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
-                        let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
-                        let c_pes = layer.design.min + lo + local_center;
+                        if self.node_edit_mode {
+                            // Affichage des nœuds vectoriels et poignées de Bézier
+                            if let Some(ref vpaths) = layer.vector_paths {
+                                let guide_stroke = Stroke::new(
+                                    1.2_f32,
+                                    Color32::from_rgba_unmultiplied(0, 180, 255, 160),
+                                );
+                                let tangent_stroke =
+                                    Stroke::new(1.2_f32, Color32::from_rgb(50, 220, 120));
 
-                        let rad = layer.rotation.to_radians();
-                        let cos_r = rad.cos();
-                        let sin_r = rad.sin();
-                        let half_w = scaled_w * 0.5;
-                        let half_h = scaled_h * 0.5;
+                                for (pi, vp) in vpaths.iter().enumerate() {
+                                    let seg_count = if vp.closed {
+                                        vp.nodes.len()
+                                    } else {
+                                        vp.nodes.len().saturating_sub(1)
+                                    };
+                                    for si in 0..seg_count {
+                                        let n0 = &vp.nodes[si];
+                                        let n1 = &vp.nodes[(si + 1) % vp.nodes.len()];
+                                        let poly = sample_segment_polyline(n0, n1);
+                                        let screen_poly: Vec<Pos2> = poly
+                                            .into_iter()
+                                            .map(|p| to_screen(layer.transform_point(p)))
+                                            .collect();
+                                        painter.add(Shape::line(screen_poly, guide_stroke));
+                                    }
 
-                        let local_corners = [
-                            Vec2::new(-half_w, -half_h),
-                            Vec2::new(half_w, -half_h),
-                            Vec2::new(half_w, half_h),
-                            Vec2::new(-half_w, half_h),
-                        ];
-                        let sc = local_corners.map(|c| {
-                            let rot_c = Vec2::new(c.x * cos_r - c.y * sin_r, c.x * sin_r + c.y * cos_r);
-                            to_screen(c_pes + rot_c)
-                        });
+                                    for (ni, node) in vp.nodes.iter().enumerate() {
+                                        let is_sel = self.selected_node
+                                            == Some(NodeSelection {
+                                                path_idx: pi,
+                                                node_idx: ni,
+                                            });
+                                        let s_pos = to_screen(layer.transform_point(node.pos));
 
-                        let accent = Color32::from_rgb(60, 160, 255);
-                        for i in 0..4 {
+                                        // Si le nœud est sélectionné, dessine ses poignées de Bézier
+                                        if is_sel {
+                                            if node.handle_in != Vec2::ZERO {
+                                                let h_in_s = to_screen(
+                                                    layer.transform_point(
+                                                        node.pos + node.handle_in,
+                                                    ),
+                                                );
+                                                painter.line_segment(
+                                                    [s_pos, h_in_s],
+                                                    tangent_stroke,
+                                                );
+                                                painter.circle_filled(
+                                                    h_in_s,
+                                                    4.5,
+                                                    Color32::from_rgb(50, 220, 120),
+                                                );
+                                                painter.circle_stroke(
+                                                    h_in_s,
+                                                    4.5,
+                                                    Stroke::new(1.0_f32, Color32::WHITE),
+                                                );
+                                            }
+                                            if node.handle_out != Vec2::ZERO {
+                                                let h_out_s = to_screen(
+                                                    layer.transform_point(
+                                                        node.pos + node.handle_out,
+                                                    ),
+                                                );
+                                                painter.line_segment(
+                                                    [s_pos, h_out_s],
+                                                    tangent_stroke,
+                                                );
+                                                painter.circle_filled(
+                                                    h_out_s,
+                                                    4.5,
+                                                    Color32::from_rgb(50, 220, 120),
+                                                );
+                                                painter.circle_stroke(
+                                                    h_out_s,
+                                                    4.5,
+                                                    Stroke::new(1.0_f32, Color32::WHITE),
+                                                );
+                                            }
+                                        }
+
+                                        let node_rect = Rect::from_center_size(
+                                            s_pos,
+                                            Vec2::splat(if is_sel { 9.0 } else { 7.0 }),
+                                        );
+                                        let fill = if is_sel {
+                                            Color32::from_rgb(255, 190, 40)
+                                        } else {
+                                            Color32::from_rgb(40, 160, 255)
+                                        };
+                                        painter.rect_filled(node_rect, 1.5, fill);
+                                        painter.rect_stroke(
+                                            node_rect,
+                                            1.5,
+                                            Stroke::new(1.0_f32, Color32::WHITE),
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            // Boîte de transformation globale (déplacement, échelle, rotation)
+                            let base = layer.base_size();
+                            let scaled_w = base.x * layer.scale_x;
+                            let scaled_h = base.y * layer.scale_y;
+                            let local_center = Vec2::new(scaled_w * 0.5, scaled_h * 0.5);
+                            let lo = Vec2::new(layer.offset_x as f32, layer.offset_y as f32);
+                            let c_pes = layer.design.min + lo + local_center;
+
+                            let rad = layer.rotation.to_radians();
+                            let cos_r = rad.cos();
+                            let sin_r = rad.sin();
+                            let half_w = scaled_w * 0.5;
+                            let half_h = scaled_h * 0.5;
+
+                            let local_corners = [
+                                Vec2::new(-half_w, -half_h),
+                                Vec2::new(half_w, -half_h),
+                                Vec2::new(half_w, half_h),
+                                Vec2::new(-half_w, half_h),
+                            ];
+                            let sc = local_corners.map(|c| {
+                                let rot_c = Vec2::new(
+                                    c.x * cos_r - c.y * sin_r,
+                                    c.x * sin_r + c.y * cos_r,
+                                );
+                                to_screen(c_pes + rot_c)
+                            });
+
+                            let accent = Color32::from_rgb(60, 160, 255);
+                            for i in 0..4 {
+                                painter.line_segment(
+                                    [sc[i], sc[(i + 1) % 4]],
+                                    Stroke::new(
+                                        1.5_f32,
+                                        Color32::from_rgba_unmultiplied(60, 160, 255, 190),
+                                    ),
+                                );
+                            }
+
+                            let resize_rect = Rect::from_center_size(sc[2], Vec2::splat(10.0));
+                            painter.rect_filled(resize_rect, 2.0, accent);
+                            painter.rect_stroke(
+                                resize_rect,
+                                2.0,
+                                Stroke::new(1.0_f32, Color32::WHITE),
+                            );
+
+                            let top_center = sc[0].lerp(sc[1], 0.5);
+                            let rot_dir = Vec2::new(-sin_r, cos_r);
+                            let rot_handle = top_center - rot_dir * 25.0;
                             painter.line_segment(
-                                [sc[i], sc[(i + 1) % 4]],
-                                Stroke::new(1.5_f32, Color32::from_rgba_unmultiplied(60, 160, 255, 190)),
+                                [top_center, rot_handle],
+                                Stroke::new(1.0_f32, accent),
+                            );
+                            let rot_rect = Rect::from_center_size(rot_handle, Vec2::splat(10.0));
+                            painter.rect_filled(rot_rect, 5.0, Color32::from_rgb(50, 200, 100));
+                            painter.rect_stroke(
+                                rot_rect,
+                                5.0,
+                                Stroke::new(1.0_f32, Color32::WHITE),
                             );
                         }
-
-                        // Bottom-right resize handle
-                        let resize_rect = Rect::from_center_size(sc[2], Vec2::splat(10.0));
-                        painter.rect_filled(resize_rect, 2.0, accent);
-                        painter.rect_stroke(resize_rect, 2.0, Stroke::new(1.0_f32, Color32::WHITE));
-
-                        // Top rotation handle & stem line
-                        let top_center = sc[0].lerp(sc[1], 0.5);
-                        let rot_dir = Vec2::new(-sin_r, cos_r);
-                        let rot_handle = top_center - rot_dir * 25.0;
-                        painter.line_segment([top_center, rot_handle], Stroke::new(1.0_f32, accent));
-                        let rot_rect = Rect::from_center_size(rot_handle, Vec2::splat(10.0));
-                        painter.rect_filled(rot_rect, 5.0, Color32::from_rgb(50, 200, 100));
-                        painter.rect_stroke(rot_rect, 5.0, Stroke::new(1.0_f32, Color32::WHITE));
                     }
                 }
             });
