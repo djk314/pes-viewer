@@ -1,20 +1,13 @@
 [package]
 name = "pes-viewer"
-version = "0.1.2"
+version = "1.3.0"
 edition = "2021"
-description = "Brother PES embroidery viewer"
 
-# Shown in the window title, the app menu and the AppImage file name.
-[package.metadata]
-display_name = "PES Viewer"
+# main.rs reads this line to build the window title
+display_name = "Pes viewer 1.3"
 
 [dependencies]
 eframe = "0.29"
-rfd = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
-usvg = "0.43"
-
-[profile.release]
-opt-level = 3
-lto = "thin"
-strip = true
+rfd = "0.15"
+usvg = "0.44"   # keep whatever version you already have
