@@ -2,7 +2,8 @@
 //!
 //! - Open .pes and .svg files with a dialog (Ctrl+O), drag & drop, or a command-line argument
 //! - Add multiple .pes / .svg layers, drag, resize, rotate, and edit vector/Bezier nodes directly
-//! - Export the current view to PNG or the merged layers to PES v6 (#PES0060)
+//! - Load PNG bitmaps through a built-in vectorizer (editable Bezier paths)
+//! - Export the current view to PNG, the active layer to SVG, or the merged layers to PES v1..v9
 
 use eframe::egui::{self, Align2, Color32, FontId, Key, Pos2, Rect, Sense, Shape, Stroke, Vec2};
 use image::imageops::{self, FilterType};
@@ -10,6 +11,14 @@ use image::{Rgba, RgbaImage};
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+
+mod optimize;
+mod pes_io;
+mod vectorize;
+
+use pes_io::PesVersion;
+use optimize::OptimizeOptions;
+use vectorize::VectorizeOptions;
 
 // ---------------------------------------------------------------------------
 // Data model & Vector Node / Bezier structures
@@ -49,6 +58,7 @@ struct VectorPath {
 }
 
 /// A polyline drawn with one thread color.
+#[derive(Clone)]
 struct Run {
     /// PEC palette index.
     color: u8,
@@ -57,6 +67,7 @@ struct Run {
     fill: Vec<f32>,
 }
 
+#[derive(Clone)]
 struct Design {
     runs: Vec<Run>,
     jumps: Vec<[Pos2; 2]>,
@@ -66,6 +77,7 @@ struct Design {
     color_blocks: usize,
 }
 
+#[derive(Clone)]
 struct EmbroideryLayer {
     name: String,
     stitches: Vec<Stitch>,
@@ -386,7 +398,11 @@ fn sample_vector_paths_to_stitches(paths: &[VectorPath]) -> (Vec<Stitch>, Vec<u8
 fn is_supported_embroidery_file(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("pes") || ext.eq_ignore_ascii_case("svg"))
+        .map(|ext| {
+            ext.eq_ignore_ascii_case("pes")
+                || ext.eq_ignore_ascii_case("svg")
+                || ext.eq_ignore_ascii_case("png")
+        })
         .unwrap_or(false)
 }
 
@@ -442,7 +458,46 @@ fn load_layer_from_file(path: &Path) -> Result<EmbroideryLayer, String> {
     }
 }
 
+fn is_png(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("png"))
+        .unwrap_or(false)
+}
+
+/// Builds an editable layer from vector paths (SVG import and bitmap tracing share this).
+fn layer_from_paths(name: String, vector_paths: Vec<VectorPath>) -> Result<EmbroideryLayer, String> {
+    let (stitches, palette) = sample_vector_paths_to_stitches(&vector_paths);
+    if stitches.is_empty() {
+        return Err("no stitches generated from vector paths".into());
+    }
+    let design = build_design(&stitches, &palette);
+    Ok(EmbroideryLayer {
+        name,
+        stitches,
+        palette,
+        design,
+        vector_paths: Some(vector_paths),
+        offset_x: 0,
+        offset_y: 0,
+        scale_x: 1.0,
+        scale_y: 1.0,
+        rotation: 0.0,
+        visible: true,
+    })
+}
+
 fn parse_design_file(path: &Path) -> Result<(Vec<Stitch>, Vec<u8>), String> {
+    if is_png(path) {
+        // used for thumbnails/previews: quick, lower resolution trace
+        let opt = VectorizeOptions { work_size: 200, ..VectorizeOptions::default() };
+        let paths = vectorize::vectorize_file(path, &opt)?;
+        let (stitches, palette) = sample_vector_paths_to_stitches(&paths);
+        if stitches.is_empty() {
+            return Err("no stitches generated from PNG".into());
+        }
+        return Ok((stitches, palette));
+    }
     let data = fs::read(path).map_err(|e| e.to_string())?;
     let is_svg = path
         .extension()
@@ -838,6 +893,7 @@ fn render_1bit_thumbnail(design: &Design, block_filter: Option<usize>, stitches:
     buf
 }
 
+#[allow(dead_code)]
 fn export_pes_v6(layers: &[EmbroideryLayer], path: &Path) -> Result<(), String> {
     let (merged_stitches, merged_palette) = merge_layers_data(layers)?;
     let merged_design = build_design(&merged_stitches, &merged_palette);
@@ -1482,6 +1538,13 @@ struct NodeSelection {
     node_idx: usize,
 }
 
+/// Pending "vectorize bitmap" dialog state.
+struct TraceDialog {
+    path: PathBuf,
+    opts: VectorizeOptions,
+    append: bool,
+}
+
 struct PesApp {
     layers: Vec<EmbroideryLayer>,
     active_layer: Option<usize>,
@@ -1514,6 +1577,15 @@ struct PesApp {
     browser: Option<Browser>,
     thumbs: HashMap<PathBuf, Thumb>,
     preview: Option<(PathBuf, Thumb)>,
+
+    clipboard: Option<EmbroideryLayer>,
+    show_about: bool,
+    trace: Option<TraceDialog>,
+    export_version: PesVersion,
+    opt_dialog: bool,
+    opt_opts: OptimizeOptions,
+    opt_on_export: bool,
+    opt_report: Option<optimize::Report>,
 }
 
 impl PesApp {
@@ -1545,6 +1617,14 @@ impl PesApp {
             browser: None,
             thumbs: HashMap::new(),
             preview: None,
+            clipboard: None,
+            show_about: false,
+            trace: None,
+            export_version: PesVersion::V6,
+            opt_dialog: false,
+            opt_opts: OptimizeOptions::default(),
+            opt_on_export: true,
+            opt_report: None,
         };
         if let Some(p) = initial {
             app.load(p, false);
@@ -1553,23 +1633,123 @@ impl PesApp {
     }
 
     fn load(&mut self, path: PathBuf, append: bool) {
+        if is_png(&path) {
+            // bitmaps go through the vectorize dialog first
+            self.browser = None;
+            self.trace = Some(TraceDialog { path, opts: VectorizeOptions::default(), append });
+            return;
+        }
         match load_layer_from_file(&path) {
             Ok(layer) => {
-                if !append {
-                    self.layers.clear();
-                    self.fit_pending = true;
-                    self.refresh_dir(&path);
-                    self.current = Some(path);
-                    self.scroll_to_current = true;
-                    self.title_dirty = true;
+                let version = if path
+                    .extension()
+                    .map_or(false, |e| e.to_string_lossy().eq_ignore_ascii_case("pes"))
+                {
+                    fs::read(&path).ok().and_then(|d| pes_io::detect_version(&d))
+                } else {
+                    None
+                };
+                self.install_layer(layer, path, append);
+                if let Some(v) = version {
+                    self.status = format!("Loaded {v}");
                 }
-                self.layers.push(layer);
-                self.active_layer = Some(self.layers.len() - 1);
-                self.selected_node = None;
-                self.browser = None;
-                self.status.clear();
             }
             Err(e) => self.status = format!("{}: {e}", path.display()),
+        }
+    }
+
+    fn install_layer(&mut self, layer: EmbroideryLayer, path: PathBuf, append: bool) {
+        if !append {
+            self.layers.clear();
+            self.fit_pending = true;
+            self.refresh_dir(&path);
+            self.current = Some(path);
+            self.scroll_to_current = true;
+            self.title_dirty = true;
+        }
+        self.layers.push(layer);
+        self.active_layer = Some(self.layers.len() - 1);
+        self.selected_node = None;
+        self.browser = None;
+        self.status.clear();
+    }
+
+    fn finish_trace(&mut self) {
+        let Some(t) = self.trace.take() else { return };
+        let name = t
+            .path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Bitmap".into());
+        match vectorize::vectorize_file(&t.path, &t.opts).and_then(|p| layer_from_paths(name, p)) {
+            Ok(layer) => {
+                let n = layer.vector_paths.as_ref().map_or(0, |p| p.len());
+                self.install_layer(layer, t.path, t.append);
+                self.fit_pending = true;
+                self.status = format!("Vectorized into {n} paths");
+            }
+            Err(e) => self.status = format!("Vectorize failed: {e}"),
+        }
+    }
+
+    // ---- Edit menu: layer clipboard ----------------------------------------
+    fn copy_layer(&mut self) {
+        if let Some(l) = self.active_layer.and_then(|i| self.layers.get(i)) {
+            self.clipboard = Some(l.clone());
+            self.status = format!("Copied layer \"{}\"", l.name);
+        }
+    }
+
+    fn delete_layer(&mut self) {
+        if let Some(i) = self.active_layer.filter(|&i| i < self.layers.len()) {
+            self.layers.remove(i);
+            self.active_layer = self.layers.len().checked_sub(1);
+            self.selected_node = None;
+        }
+    }
+
+    fn cut_layer(&mut self) {
+        if self.active_layer.is_some() {
+            self.copy_layer();
+            self.delete_layer();
+        }
+    }
+
+    fn paste_layer(&mut self) {
+        if let Some(mut l) = self.clipboard.clone() {
+            l.offset_x += 100; // 10 mm so the copy is visible
+            l.offset_y += 100;
+            l.name = format!("{} copy", l.name);
+            self.layers.push(l);
+            self.active_layer = Some(self.layers.len() - 1);
+            self.selected_node = None;
+            if self.layers.len() == 1 {
+                self.fit_pending = true;
+            }
+        }
+    }
+
+    fn save_svg(&mut self) {
+        let Some(idx) = self.active_layer.filter(|&i| i < self.layers.len()) else { return };
+        self.layers[idx].ensure_vector_paths();
+        let layer = &self.layers[idx];
+        let paths = layer.vector_paths.as_deref().unwrap_or(&[]);
+        let world = vectorize::transform_paths(paths, &|p| layer.transform_point(p));
+        let svg = vectorize::paths_to_svg(&world);
+        let default_name = format!(
+            "{}.svg",
+            Path::new(&layer.name).file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "layer".into())
+        );
+        if let Some(out) = rfd::FileDialog::new()
+            .set_title("Export active layer as SVG")
+            .set_file_name(default_name)
+            .add_filter("SVG vector", &["svg"])
+            .save_file()
+        {
+            self.status = match fs::write(&out, svg) {
+                Ok(()) => format!("Saved {}", out.display()),
+                Err(e) => format!("SVG export failed: {e}"),
+            };
         }
     }
 
@@ -1921,10 +2101,11 @@ impl PesApp {
     }
 
     fn pick_file(&mut self, add_as_layer: bool) {
-        let title = if add_as_layer { "Add PES or SVG layer" } else { "Open a PES or SVG file" };
+        let title = if add_as_layer { "Add PES, SVG or PNG layer" } else { "Open a PES, SVG or PNG file" };
         if let Some(p) = rfd::FileDialog::new()
             .set_title(title)
-            .add_filter("Embroidery & Vector (PES, SVG)", &["pes", "PES", "svg", "SVG"])
+            .add_filter("Embroidery, vector & bitmap", &["pes", "PES", "svg", "SVG", "png", "PNG"])
+            .add_filter("PNG bitmap (vectorized)", &["png", "PNG"])
             .add_filter("PES embroidery", &["pes", "PES"])
             .add_filter("SVG vector", &["svg", "SVG"])
             .pick_file()
@@ -1963,7 +2144,44 @@ impl PesApp {
         }
     }
 
-    fn save_pes_v6(&mut self) {
+    fn analyze_optimization(&mut self) {
+        match merge_layers_data(&self.layers) {
+            Ok((s, p)) => {
+                let (_, _, report) = optimize::optimize(&s, &p, &self.opt_opts);
+                self.opt_report = Some(report);
+            }
+            Err(e) => self.status = format!("Analyze failed: {e}"),
+        }
+    }
+
+    /// Replaces every layer's stitches by their optimized version (vector paths are dropped).
+    fn apply_optimization(&mut self) {
+        let opts = self.opt_opts.clone();
+        let (mut before, mut after) = (0usize, 0usize);
+        for l in self.layers.iter_mut() {
+            let (s, p, r) = optimize::optimize(&l.stitches, &l.palette, &opts);
+            if s.is_empty() {
+                continue;
+            }
+            before += r.stitches_before;
+            after += r.stitches_after;
+            let old_min = l.design.min;
+            let new_design = build_design(&s, &p);
+            let delta = new_design.min - old_min;
+            l.offset_x += (delta.x * l.scale_x).round() as i32;
+            l.offset_y += (delta.y * l.scale_y).round() as i32;
+            l.stitches = s;
+            l.palette = p;
+            l.design = new_design;
+            l.vector_paths = None;
+        }
+        self.node_edit_mode = false;
+        self.selected_node = None;
+        self.status = format!("Optimized: {before} → {after} stitches");
+        self.analyze_optimization();
+    }
+
+    fn save_pes(&mut self, ver: PesVersion) {
         if self.layers.is_empty() {
             return;
         }
@@ -1974,13 +2192,24 @@ impl PesApp {
             .map(|s| format!("{}_merged.pes", s.to_string_lossy()))
             .unwrap_or_else(|| "merged.pes".into());
         if let Some(out) = rfd::FileDialog::new()
-            .set_title("Export Merged PES v6")
+            .set_title(format!("Export merged {}", ver.label()))
             .set_file_name(default_name)
             .add_filter("PES embroidery", &["pes"])
             .save_file()
         {
-            self.status = match export_pes_v6(&self.layers, &out) {
-                Ok(()) => format!("Exported PES v6: {}", out.display()),
+            let opt = if self.opt_on_export { Some(self.opt_opts.clone()) } else { None };
+            self.status = match pes_io::export_pes(&self.layers, &out, ver, opt.as_ref()) {
+                Ok(Some(r)) => format!(
+                    "Exported {}: {} ({} → {} stitches, {} → {} jumps{})",
+                    ver.label(),
+                    out.display(),
+                    r.stitches_before,
+                    r.stitches_after,
+                    r.jumps_before,
+                    r.jumps_after,
+                    if r.hoop.is_none() { ", WARNING: larger than 300 x 200 mm" } else { "" }
+                ),
+                Ok(None) => format!("Exported {}: {}", ver.label(), out.display()),
                 Err(e) => format!("PES export failed: {e}"),
             };
         }
@@ -1992,13 +2221,26 @@ impl eframe::App for PesApp {
         let mut open_path: Option<(PathBuf, bool)> = None;
         let mut want_dialog: Option<bool> = None;
         let mut want_save_png = false;
-        let mut want_save_pes = false;
+        let mut want_save_pes_ver: Option<PesVersion> = None;
+        let mut want_save_svg = false;
+        let (mut do_copy, mut do_cut, mut do_paste, mut do_delete) = (false, false, false, false);
+        let kb_focus = ctx.wants_keyboard_input();
         let mut want_system_dialog: Option<bool> = None;
         let mut close_browser = false;
         let mut nav = 0i32;
 
         // ---- input -------------------------------------------------------
         ctx.input(|i| {
+            if !kb_focus {
+                for e in &i.events {
+                    match e {
+                        egui::Event::Copy => do_copy = true,
+                        egui::Event::Cut => do_cut = true,
+                        egui::Event::Paste(_) => do_paste = true,
+                        _ => {}
+                    }
+                }
+            }
             if let Some(p) = i.raw.dropped_files.iter().find_map(|f| f.path.clone()) {
                 open_path = Some((p, !self.layers.is_empty()));
             }
@@ -2025,12 +2267,124 @@ impl eframe::App for PesApp {
             }
         });
 
+        // ---- menu bar ----------------------------------------------------
+        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
+            egui::menu::bar(ui, |ui| {
+                ui.menu_button("File", |ui| {
+                    if ui.button("Open…   Ctrl+O").clicked() {
+                        want_dialog = Some(false);
+                        ui.close_menu();
+                    }
+                    if ui.button("Open with system dialog…").clicked() {
+                        want_system_dialog = Some(false);
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(!self.layers.is_empty(), egui::Button::new("Add layer…   Ctrl+Shift+O"))
+                        .clicked()
+                    {
+                        want_dialog = Some(true);
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    let has = !self.layers.is_empty();
+                    ui.add_enabled_ui(has, |ui| {
+                        ui.menu_button("Save as PES", |ui| {
+                            for v in PesVersion::ALL {
+                                if ui.button(v.label()).clicked() {
+                                    self.export_version = v;
+                                    want_save_pes_ver = Some(v);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("PNG scale");
+                            ui.add(
+                                egui::DragValue::new(&mut self.export_scale)
+                                    .range(1.0..=8.0)
+                                    .speed(0.1)
+                                    .prefix("x"),
+                            );
+                        });
+                        if ui.button("Export PNG…").clicked() {
+                            want_save_png = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("Export active layer as SVG…").clicked() {
+                            want_save_svg = true;
+                            ui.close_menu();
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Quit").clicked() {
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                });
+                ui.menu_button("Edit", |ui| {
+                    let has_layer = self.active_layer.is_some();
+                    if ui.add_enabled(has_layer, egui::Button::new("Copy layer   Ctrl+C")).clicked() {
+                        do_copy = true;
+                        ui.close_menu();
+                    }
+                    if ui.add_enabled(has_layer, egui::Button::new("Cut layer   Ctrl+X")).clicked() {
+                        do_cut = true;
+                        ui.close_menu();
+                    }
+                    if ui
+                        .add_enabled(self.clipboard.is_some(), egui::Button::new("Paste layer   Ctrl+V"))
+                        .clicked()
+                    {
+                        do_paste = true;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.add_enabled(has_layer, egui::Button::new("Delete layer")).clicked() {
+                        do_delete = true;
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("Tools", |ui| {
+                    if ui
+                        .add_enabled(!self.layers.is_empty(), egui::Button::new("Optimize for PR680W…"))
+                        .clicked()
+                    {
+                        self.opt_dialog = true;
+                        ui.close_menu();
+                    }
+                });
+                ui.menu_button("View", |ui| {
+                    ui.selectable_value(&mut self.mode, ViewMode::Embroidery, "3D embroidery");
+                    ui.selectable_value(&mut self.mode, ViewMode::Flat, "Flat 2D");
+                    ui.checkbox(&mut self.show_jumps, "Show thread links (jumps)");
+                    ui.separator();
+                    if ui.button("Fit to window   F").clicked() {
+                        self.fit_pending = true;
+                        ui.close_menu();
+                    }
+                    if ui.button("Actual size").clicked() {
+                        self.zoom = ACTUAL_SIZE_ZOOM;
+                        self.offset = Vec2::ZERO;
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.horizontal(|ui| {
+                        ui.label("Background");
+                        ui.color_edit_button_srgb(&mut self.bg);
+                    });
+                });
+                ui.menu_button("Help", |ui| {
+                    if ui.button("About").clicked() {
+                        self.show_about = true;
+                        ui.close_menu();
+                    }
+                });
+            });
+        });
+
         // ---- toolbar -----------------------------------------------------
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Open…").clicked() {
-                    want_dialog = Some(false);
-                }
                 if ui
                     .add_enabled(!self.layers.is_empty(), egui::Button::new("+ Layer…"))
                     .clicked()
@@ -2109,25 +2463,6 @@ impl eframe::App for PesApp {
                 ui.checkbox(&mut self.show_jumps, "Jumps");
                 ui.label("Bg");
                 ui.color_edit_button_srgb(&mut self.bg);
-                ui.separator();
-                ui.add(
-                    egui::DragValue::new(&mut self.export_scale)
-                        .range(1.0..=8.0)
-                        .speed(0.1)
-                        .prefix("x"),
-                );
-                if ui
-                    .add_enabled(!self.layers.is_empty(), egui::Button::new("Save PNG…"))
-                    .clicked()
-                {
-                    want_save_png = true;
-                }
-                if ui
-                    .add_enabled(!self.layers.is_empty(), egui::Button::new("Export PES v6…"))
-                    .clicked()
-                {
-                    want_save_pes = true;
-                }
             });
         });
 
@@ -3234,7 +3569,148 @@ impl eframe::App for PesApp {
                 }
             });
 
+        // ---- About window --------------------------------------------------
+        let mut about_open = self.show_about;
+        egui::Window::new("About")
+            .open(&mut about_open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                ui.heading("Pes viewer version 1.3 from Kapi");
+            });
+        self.show_about = about_open;
+
+        // ---- Vectorize bitmap dialog ------------------------------------------
+        let (mut run_trace, mut cancel_trace) = (false, false);
+        if let Some(t) = self.trace.as_mut() {
+            egui::Window::new("Vectorize bitmap")
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(
+                        t.path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_default(),
+                    );
+                    ui.add(egui::Slider::new(&mut t.opts.max_colors, 1..=16).text("thread colours"));
+                    ui.add(egui::Slider::new(&mut t.opts.target_mm, 10.0..=300.0).text("size (mm)"));
+                    ui.add(egui::Slider::new(&mut t.opts.work_size, 100..=1000).text("detail (px)"));
+                    ui.add(egui::Slider::new(&mut t.opts.tolerance, 0.3..=3.0).text("simplify"));
+                    ui.add(egui::Slider::new(&mut t.opts.corner_deg, 20.0..=120.0).text("corner angle"));
+                    ui.add(egui::Slider::new(&mut t.opts.min_area, 1.0..=200.0).text("min. region area"));
+                    ui.checkbox(&mut t.opts.drop_light_bg, "Treat white as background");
+                    ui.horizontal(|ui| {
+                        if ui.button("Vectorize").clicked() {
+                            run_trace = true;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            cancel_trace = true;
+                        }
+                    });
+                });
+        }
+        if cancel_trace {
+            self.trace = None;
+        }
+        if run_trace {
+            self.finish_trace();
+        }
+
+        // ---- PR680W optimizer dialog -------------------------------------------
+        let (mut run_analyze, mut run_apply) = (false, false);
+        let mut opt_open = self.opt_dialog;
+        if opt_open {
+            egui::Window::new("Optimize for Brother PR680W")
+                .open(&mut opt_open)
+                .collapsible(false)
+                .resizable(false)
+                .anchor(Align2::RIGHT_TOP, [-10.0, 90.0])
+                .show(ctx, |ui| {
+                    let o = &mut self.opt_opts;
+                    ui.add(egui::Slider::new(&mut o.max_stitch_mm, 1.0..=optimize::HARD_MAX_STITCH_MM).text("max stitch (mm)"));
+                    ui.add(egui::Slider::new(&mut o.min_stitch_mm, 0.1..=1.5).text("min stitch (mm)"));
+                    ui.add(egui::Slider::new(&mut o.tolerance_mm, 0.02..=0.5).text("tolerance (mm)"));
+                    ui.add(egui::Slider::new(&mut o.join_gap_mm, 0.0..=5.0).text("bridge gaps up to (mm)"));
+                    ui.checkbox(&mut o.reorder, "Reorder runs (shorter travel, fewer trims)");
+                    ui.checkbox(&mut o.merge_colors, "Merge identical colours (changes stacking order)");
+                    ui.checkbox(&mut self.opt_on_export, "Optimize automatically when exporting PES");
+                    ui.horizontal(|ui| {
+                        if ui.button("Analyze").clicked() {
+                            run_analyze = true;
+                        }
+                        if ui.button("Apply to layers").clicked() {
+                            run_apply = true;
+                        }
+                    });
+                    if let Some(r) = &self.opt_report {
+                        ui.separator();
+                        ui.label(format!(
+                            "Stitches: {} → {} ({:+.0}%)",
+                            r.stitches_before,
+                            r.stitches_after,
+                            -r.saved_percent()
+                        ));
+                        ui.label(format!("Jumps / trims: {} → {}", r.jumps_before, r.jumps_after));
+                        ui.label(format!("Jump travel: {:.0} → {:.0} mm", r.travel_before_mm, r.travel_after_mm));
+                        ui.label(format!("Colour blocks: {} → {}", r.blocks_before, r.blocks_after));
+                        if r.distinct_colors > optimize::PR680W_NEEDLES {
+                            ui.colored_label(
+                                Color32::from_rgb(255, 120, 80),
+                                format!(
+                                    "{} distinct colours: more than {} needles, manual thread swaps needed",
+                                    r.distinct_colors,
+                                    optimize::PR680W_NEEDLES
+                                ),
+                            );
+                        } else {
+                            ui.label(format!(
+                                "{} distinct colours (fits the {} needles)",
+                                r.distinct_colors,
+                                optimize::PR680W_NEEDLES
+                            ));
+                        }
+                        ui.label(format!("Longest stitch: {:.1} mm", r.longest_stitch_mm));
+                        match r.hoop {
+                            Some(h) => ui.label(format!("Size {:.0} x {:.0} mm → hoop {h}", r.width_mm, r.height_mm)),
+                            None => ui.colored_label(
+                                Color32::from_rgb(255, 120, 80),
+                                format!("Size {:.0} x {:.0} mm exceeds the 300 x 200 mm area", r.width_mm, r.height_mm),
+                            ),
+                        };
+                        ui.label(format!("≈ {:.1} min at 800 spm", r.minutes_at(800.0)));
+                        if r.reorder_skipped {
+                            ui.label("Too many runs: reordering skipped.");
+                        }
+                    }
+                });
+        }
+        self.opt_dialog = opt_open;
+        if run_analyze {
+            self.analyze_optimization();
+        }
+        if run_apply {
+            self.apply_optimization();
+        }
+
         // ---- deferred actions --------------------------------------------
+        if do_copy {
+            self.copy_layer();
+        }
+        if do_cut {
+            self.cut_layer();
+        }
+        if do_paste {
+            self.paste_layer();
+        }
+        if do_delete {
+            self.delete_layer();
+        }
+        if want_save_svg {
+            self.save_svg();
+        }
         if close_browser {
             self.browser = None;
         }
@@ -3257,8 +3733,8 @@ impl eframe::App for PesApp {
         if want_save_png {
             self.save_png();
         }
-        if want_save_pes {
-            self.save_pes_v6();
+        if let Some(v) = want_save_pes_ver {
+            self.save_pes(v);
         }
         if self.title_dirty {
             let title = match &self.current {
